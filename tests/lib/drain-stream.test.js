@@ -138,44 +138,11 @@ describe('a real child process writing far more than a pipe holds', () => {
   }, 15_000);
 
   // Sized for the slowest CI leg: BSD `tr` on the macOS runner manages
-  // roughly 30 MB/s, so the windows below leave real margin for a reader
-  // that keeps up. Process RSS is only compared against the volume itself:
-  // absolute allocator overhead differs by tens of MB between Bun versions,
-  // but a reader that hoards grows by at least the volume and one that
-  // drains by well under it.
-  test('control: the old loop, which stopped reading after one error, blocks the child or hoards its output', async () => {
-    const BYTES = 100_000_000;
-    const rssBefore = process.memoryUsage().rss;
-    const proc = writeToStderr(BYTES);
-    const reader = proc.stderr.getReader();
-    let received = 0;
-    // Pre-fix shape: one try/catch around the whole loop, so the first throw ends it.
-    (async () => {
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          received += value.length;
-          throw new RangeError('Invalid string length');
-        }
-      } catch {
-        // Stream closed
-      }
-    })();
-
-    const outcome = await exitedWithin(proc, 10_000);
-    const rssGrowth = process.memoryUsage().rss - rssBefore;
-    proc.kill();
-    await proc.exited;
-    reader.cancel().catch(() => {});
-
-    // JavaScript saw almost nothing either way …
-    expect(received).toBeLessThan(1_000_000);
-    // … and the child is stuck on a full pipe (it would finish in ~2 s if
-    // anyone read), or the process is holding the whole output.
-    expect(!outcome.exited || rssGrowth > BYTES).toBe(true);
-  }, 15_000);
-
+  // roughly 30 MB/s. Process RSS is only compared against the volume:
+  // absolute allocator overhead differs by tens of MB between Bun versions.
+  // What the abandoned pre-fix loop does with the same volume also differs by
+  // Bun version and platform (blocks the child, hoards it in memory, or
+  // neither shows in RSS), so that is characterized in the PR, not asserted.
   test('drainStream does not hoard the same volume', async () => {
     const BYTES = 100_000_000;
     const rssBefore = process.memoryUsage().rss;
