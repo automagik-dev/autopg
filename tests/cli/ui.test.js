@@ -74,6 +74,85 @@ describe('parseArgs', () => {
   });
 });
 
+describe('dispatch --help', () => {
+  test('prints usage + the resolved console root and exits 0 without binding', async () => {
+    const ui = freshUi();
+    const consoleRoot = path.join(tmpHome, 'console-root');
+    fs.mkdirSync(consoleRoot);
+    const chunks = [];
+    const origWrite = process.stdout.write;
+    process.stdout.write = (chunk) => {
+      chunks.push(String(chunk));
+      return true;
+    };
+    let code;
+    try {
+      code = await ui.dispatch(['--help'], { consoleRoot });
+    } finally {
+      process.stdout.write = origWrite;
+    }
+    const out = chunks.join('');
+    expect(code).toBe(0);
+    expect(out).toContain('Usage: autopg ui');
+    expect(out).toContain(`console root: ${consoleRoot}`);
+  });
+});
+
+describe('release-binary layout (issue #161)', () => {
+  // The tarball is `autopg/autopg` + `autopg/console/dist/`; the compiled
+  // binary must find the console next to itself, not via __dirname (which
+  // the bundler inlines as the build machine's checkout).
+  test('isCompiledBinary: bun virtual-fs argv[1] or an `autopg` executable', () => {
+    const { isCompiledBinary } = freshUi()._internals;
+    expect(isCompiledBinary({ argv: ['bun', '/$bunfs/root/autopg-cli.js'], execPath: '/usr/local/bin/bun' })).toBe(true);
+    expect(isCompiledBinary({ argv: ['bun', 'B:\\~BUN\\root\\autopg-cli.js'], execPath: 'C:\\bun.exe' })).toBe(true);
+    expect(isCompiledBinary({ argv: ['bun', '/x/bin/autopg-cli.js'], execPath: '/opt/autopg/3.2.1/autopg' })).toBe(true);
+    expect(isCompiledBinary({ argv: ['node', '/x/bin/autopg-wrapper.cjs'], execPath: '/usr/bin/node' })).toBe(false);
+    expect(isCompiledBinary({ argv: ['bun', '/x/tests/cli/ui.test.js'], execPath: '/home/u/.bun/bin/bun' })).toBe(false);
+  });
+
+  test('resolveConsoleRoot prefers console/dist next to the compiled executable', () => {
+    const { resolveConsoleRoot } = freshUi();
+    const releaseDir = path.join(tmpHome, 'release', 'autopg');
+    fs.mkdirSync(path.join(releaseDir, 'console', 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(releaseDir, 'console', 'dist', 'index.html'), '<!doctype html>');
+    const execPath = path.join(releaseDir, 'autopg');
+    fs.writeFileSync(execPath, '', { mode: 0o755 });
+    const compiled = { argv: ['bun', '/$bunfs/root/autopg-cli.js'], execPath };
+
+    expect(resolveConsoleRoot(compiled)).toBe(path.join(releaseDir, 'console', 'dist'));
+
+    // Same executable, console not shipped next to it (the v3.2.0 shape):
+    // falls back to the repo's console/ rather than pointing into $bunfs.
+    fs.rmSync(path.join(releaseDir, 'console'), { recursive: true });
+    expect(resolveConsoleRoot(compiled).startsWith(path.join(REPO_ROOT, 'console'))).toBe(true);
+  });
+
+  test('resolveConsoleRoot ignores the executable dir when not compiled', () => {
+    const { resolveConsoleRoot } = freshUi();
+    const devDir = path.join(tmpHome, 'dev');
+    fs.mkdirSync(path.join(devDir, 'console', 'dist'), { recursive: true });
+    fs.writeFileSync(path.join(devDir, 'console', 'dist', 'index.html'), '<!doctype html>');
+    const notCompiled = { argv: ['node', '/x/bin/autopg-wrapper.cjs'], execPath: path.join(devDir, 'node') };
+    expect(resolveConsoleRoot(notCompiled).startsWith(path.join(REPO_ROOT, 'console'))).toBe(true);
+  });
+
+  test('statusCommand hands the verb straight to the binary when it is the runtime', () => {
+    const { statusCommand } = freshUi()._internals;
+    // npm wrapper: `<node> <wrapper> status --json`
+    expect(statusCommand('/x/bin/autopg-wrapper.cjs')).toEqual({
+      file: process.execPath,
+      args: ['/x/bin/autopg-wrapper.cjs', 'status', '--json'],
+    });
+    // compiled binary (bin/autopg-cli.js passes scriptPath = process.execPath):
+    // `<autopg> status --json`, never `<autopg> <autopg> status --json`.
+    expect(statusCommand(process.execPath)).toEqual({
+      file: process.execPath,
+      args: ['status', '--json'],
+    });
+  });
+});
+
 describe('server boot', () => {
   test('binds 127.0.0.1 and prints the URL', async () => {
     const { server, port, url, close } = await bootServer();

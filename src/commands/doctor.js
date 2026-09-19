@@ -34,12 +34,17 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
-import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-const require = createRequire(import.meta.url);
-const { PM2_PROCESS_NAME } = require('../lib/service-state.cjs');
-const { describePm2Persistence, inspectPm2Persistence } = require('../lib/pm2-persistence.cjs');
+// Static imports, NOT `createRequire` + `require('../lib/x.cjs')`:
+// `bun build --compile` cannot bundle a createRequire'd path, so the
+// compiled tarball binary resolved it at runtime inside /$bunfs and died
+// with "Cannot find module '../lib/service-state.cjs'" (#159). Bun bundles
+// CJS imported from ESM fine (see src/postgres.js → settings-loader.cjs).
+// Guarded by tests/commands/no-create-require.test.js.
+import { PM2_PROCESS_NAME } from '../lib/service-state.cjs';
+import { describePm2Persistence, inspectPm2Persistence } from '../lib/pm2-persistence.cjs';
 import { getAdminFilePath, readAdminJson, SUPERVISOR_VALUES } from '../lib/admin-json.js';
 import { resolveSocketDir } from '../lib/socket-dir.js';
 import { readRuntimeJson, isLiveRuntime } from '../lib/runtime-json.js';
@@ -65,9 +70,15 @@ function check(id, title, severity, detail, hint) {
   return f;
 }
 
+// Same version source as bin/autopg-cli.js: the bun `--define BUILD_VERSION`
+// literal in the compiled binary (package.json is not in /$bunfs), the
+// on-disk package.json otherwise.
 function getCurrentVersion() {
+  if (typeof BUILD_VERSION !== 'undefined' && BUILD_VERSION) return BUILD_VERSION;
   try {
-    return require('../../package.json').version;
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const pkg = JSON.parse(fs.readFileSync(path.join(here, '..', '..', 'package.json'), 'utf8'));
+    return pkg.version || undefined;
   } catch {
     return undefined;
   }

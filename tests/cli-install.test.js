@@ -130,8 +130,8 @@ function readCallLog(callsPath) {
   return fs.readFileSync(callsPath, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
 }
 
-function runCli(args, env = {}) {
-  return spawnSync('node', [BIN, ...args], {
+function runCli(args, env = {}, bin = BIN) {
+  return spawnSync('node', [bin, ...args], {
     encoding: 'utf8',
     env: {
       ...process.env,
@@ -401,6 +401,92 @@ describe('pgserve install', () => {
     expect(scriptArgs).toContain('--port');
     const portIdx = scriptArgs.indexOf('--port');
     expect(scriptArgs[portIdx + 1]).toBe('8500');
+  });
+
+  test('autopg install (wrapper) runs autopg-ui through bin/autopg-wrapper.cjs', () => {
+    runCli(['install']);
+    const uiStart = readCallLog(stubBin.calls).find((c) => {
+      const i = c.indexOf('--name');
+      return c[0] === 'start' && i >= 0 && c[i + 1] === 'autopg-ui';
+    });
+    expect(uiStart).toBeDefined();
+    expect(uiStart[1]).toBe(BIN);
+    expect(uiStart.slice(uiStart.indexOf('--') + 1)).toEqual([
+      'ui', '--no-open', '--port', '8433', '--host', '127.0.0.1',
+    ]);
+  });
+
+  test('autopg install (compiled binary, issue #161) runs autopg-ui as the binary itself', () => {
+    // Stand-in for the release tarball's `autopg`: an executable with NO
+    // bin/autopg-wrapper.cjs sibling that dispatches exactly like
+    // bin/autopg-cli.js — scriptPath and wrapperPath are both "self".
+    // Pre-fix, install derived `<dir>/autopg-wrapper.cjs`, found nothing and
+    // skipped the console on every release install.
+    // realpath: node resolves __filename through symlinks (macOS /var →
+    // /private/var), and the pm2 args must match byte-for-byte.
+    const releaseDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pgserve-release-')));
+    const binary = path.join(releaseDir, 'autopg');
+    fs.writeFileSync(
+      binary,
+      `#!/usr/bin/env node
+const cli = require(${JSON.stringify(path.join(REPO_ROOT, 'src', 'cli-install.cjs'))});
+const self = __filename;
+const result = cli.dispatch(process.argv[2], process.argv.slice(3), { scriptPath: self, wrapperPath: self });
+Promise.resolve(result).then(
+  (code) => process.exit(typeof code === 'number' ? code : 0),
+  (err) => { process.stderr.write(String(err && err.message || err) + '\\n'); process.exit(1); },
+);
+`,
+      { mode: 0o755 },
+    );
+    try {
+      const result = runCli(['install'], {}, binary);
+      expect(result.status).toBe(0);
+      expect(result.stderr).not.toContain('skipping UI install');
+      expect(result.stdout).toContain('UI installed');
+
+      const starts = readCallLog(stubBin.calls).filter((c) => c[0] === 'start');
+      const byName = Object.fromEntries(starts.map((c) => [c[c.indexOf('--name') + 1], c]));
+      expect(Object.keys(byName).sort()).toEqual(['autopg-server', 'autopg-ui']);
+
+      // Both pm2 processes exec the binary directly (no interpreter); the
+      // UI one is `<self> ui --no-open --port … --host …`.
+      expect(byName['autopg-server'][1]).toBe(binary);
+      expect(byName['autopg-ui'][1]).toBe(binary);
+      expect(byName['autopg-ui'].slice(2, 4)).toEqual(['--name', 'autopg-ui']);
+      expect(byName['autopg-ui']).toContain('--interpreter');
+      expect(byName['autopg-ui'][byName['autopg-ui'].indexOf('--interpreter') + 1]).toBe('none');
+      expect(byName['autopg-ui'].slice(byName['autopg-ui'].indexOf('--') + 1)).toEqual([
+        'ui', '--no-open', '--port', '8433', '--host', '127.0.0.1',
+      ]);
+    } finally {
+      fs.rmSync(releaseDir, { recursive: true, force: true });
+    }
+  });
+
+  test('autopg install names the missing launcher when neither wrapper nor binary exists', () => {
+    // A ctx without wrapperPath and with a scriptPath whose dir has no
+    // wrapper: the daemon still installs; the console is skipped LOUDLY.
+    const releaseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pgserve-nolauncher-'));
+    const entry = path.join(releaseDir, 'entry.cjs');
+    fs.writeFileSync(
+      entry,
+      `const cli = require(${JSON.stringify(path.join(REPO_ROOT, 'src', 'cli-install.cjs'))});
+Promise.resolve(cli.dispatch('install', process.argv.slice(2), { scriptPath: ${JSON.stringify(path.join(releaseDir, 'postgres-server.js'))} }))
+  .then((code) => process.exit(typeof code === 'number' ? code : 0));
+`,
+    );
+    try {
+      const result = runCli([], {}, entry);
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain(`console launcher not found at ${path.join(releaseDir, 'autopg-wrapper.cjs')}`);
+      const names = readCallLog(stubBin.calls)
+        .filter((c) => c[0] === 'start')
+        .map((c) => c[c.indexOf('--name') + 1]);
+      expect(names).toEqual(['autopg-server']);
+    } finally {
+      fs.rmSync(releaseDir, { recursive: true, force: true });
+    }
   });
 
   test('autopg uninstall tears down both autopg-server and autopg-ui', () => {

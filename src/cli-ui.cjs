@@ -1,8 +1,9 @@
 /**
- * `autopg ui [--port N] [--no-open]` (also reachable via `pgserve ui`).
+ * `autopg ui [--port N] [--host H] [--no-open]` (also reachable via `pgserve ui`).
  *
  * Boots a tiny http server bound to 127.0.0.1 that:
- *   - serves the static console at `console/` (React + Babel CDN, no build).
+ *   - serves the static console from `console/dist/` (see resolveConsoleRoot
+ *     for the repo vs release-tarball lookup).
  *   - exposes 4 helper endpoints used by the SPA:
  *       GET  /api/settings   → { settings, sources, etag }
  *       PUT  /api/settings   → writeSettings + If-Match etag check
@@ -19,6 +20,9 @@
  * Browser opening:
  *   --no-open     → skip browser launch (CI/headless paths).
  *   default       → `open` (macOS) / `xdg-open` (Linux) / `start` (Windows).
+ *
+ * `--help` / `-h` prints usage + the resolved console root and exits 0
+ * without binding a port.
  */
 
 'use strict';
@@ -141,18 +145,48 @@ function listenWithFallback(server, host, preferredPort) {
 }
 
 /**
- * Resolve the static document root. The console directory lives at the
- * repo root (alongside `bin/` and `src/`). When the package is installed
- * via npm the `files` allowlist preserves the layout.
+ * True when running inside the release binary (`bin/autopg-cli.js` compiled
+ * with `bun build --compile`). Bun keeps the bundled sources on a virtual
+ * filesystem and puts that path in argv[1] (`/$bunfs/root/<entry>` on
+ * POSIX, `B:\~BUN\root\<entry>` on Windows). `__dirname` cannot tell us:
+ * the bundler inlines it as the BUILD machine's absolute source dir, so
+ * inside a tarball install `path.resolve(__dirname, '..', 'console')`
+ * points at the CI runner's checkout — which is exactly why v3.2.0 printed
+ * "console assets not found" (issue #161). The execPath basename is a
+ * second, independent marker: the tarball binary is always `autopg`
+ * (install.sh symlinks to it; process.execPath is the resolved target).
  */
-function resolveConsoleRoot() {
+function isCompiledBinary({ argv = process.argv, execPath = process.execPath } = {}) {
+  const entry = argv[1] || '';
+  if (entry.startsWith('/$bunfs/') || entry.includes('~BUN')) return true;
+  return path.basename(execPath) === 'autopg';
+}
+
+/**
+ * Resolve the static document root.
+ *
+ *   release tarball  → console/dist/ next to the executable
+ *                      (`autopg/autopg` + `autopg/console/dist/`, staged by
+ *                      scripts/assemble-tarball.sh)
+ *   repo / npm       → console/ at the package root (alongside `bin/` and
+ *                      `src/`; the npm `files` allowlist keeps the layout)
+ *
+ * `argv` / `execPath` are injectable for tests only.
+ */
+function resolveConsoleRoot({ argv = process.argv, execPath = process.execPath } = {}) {
   // After autopg-console-dist (v2.2.2): the SPA ships pre-bundled in
   // console/dist/ instead of as flat .jsx files at console/. Prefer dist/;
   // fall back to console/src/ for repo-checkout dev mode (where dist/ is
   // gitignored and only built on demand).
+  const candidates = [];
+  if (isCompiledBinary({ argv, execPath })) {
+    candidates.push(path.join(path.dirname(execPath), 'console', 'dist'));
+  }
   const consoleParent = path.resolve(__dirname, '..', 'console');
-  const distRoot = path.join(consoleParent, 'dist');
-  if (fs.existsSync(distRoot)) return distRoot;
+  candidates.push(path.join(consoleParent, 'dist'));
+  for (const distRoot of candidates) {
+    if (fs.existsSync(path.join(distRoot, 'index.html'))) return distRoot;
+  }
 
   const srcRoot = path.join(consoleParent, 'src');
   if (fs.existsSync(srcRoot)) {
@@ -163,7 +197,8 @@ function resolveConsoleRoot() {
   }
 
   throw new Error(
-    'console assets not found: expected console/dist/ (run `bun run console:build`) or console/src/ (repo checkout)',
+    `console assets not found: expected index.html under ${candidates.join(' or ')} `
+      + '(run `bun run console:build`) or console/src/ (repo checkout)',
   );
 }
 
@@ -312,6 +347,19 @@ async function handlePostRestart(req, res, ctx = {}) {
   }
 }
 
+/**
+ * How to shell out for `status --json`. Under the npm wrapper the runtime
+ * (node) runs the script; in the release binary `ctx.scriptPath` IS
+ * `process.execPath` (see bin/autopg-cli.js) and takes the verb directly —
+ * passing it as an argument would make the binary treat its own path as
+ * the subcommand and exit with a usage dump.
+ */
+function statusCommand(scriptPath) {
+  const args = ['status', '--json'];
+  if (scriptPath && scriptPath !== process.execPath) args.unshift(scriptPath);
+  return { file: process.execPath, args };
+}
+
 function handleGetStatus(req, res, ctx) {
   // The existing wave-1 `status --json` flow returns the canonical shape.
   // Shell out via the wrapper so the response mirrors what an operator
@@ -321,7 +369,8 @@ function handleGetStatus(req, res, ctx) {
       sendJson(res, 200, ctx.statusOverride());
       return;
     }
-    const out = execFileSync(process.execPath, [ctx.scriptPath, 'status', '--json'], {
+    const { file, args } = statusCommand(ctx.scriptPath);
+    const out = execFileSync(file, args, {
       encoding: 'utf8',
       timeout: 5000,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -624,11 +673,34 @@ async function startServer({ args = [], scriptPath, consoleRoot, wireSignals = f
   return { server, port, url, close };
 }
 
+const UI_USAGE = `Usage: autopg ui [--port N] [--host H] [--no-open]
+
+Serve the autopg console (Basic Auth; password printed by \`autopg install\`).
+
+  --port N      bind exactly N (default: first free port in ${PORT_RANGE_START}-${PORT_RANGE_END})
+  --host H      bind address (default: ${HOST})
+  --no-open     do not launch a browser
+  -h, --help    print this help and where the console assets resolve
+`;
+
 /**
  * CLI dispatch entry. Boots the server and parks until SIGINT/SIGTERM.
  * Always returns 0 — the signal handlers exit the process directly.
+ *
+ * `--help` prints usage plus the resolved console root without binding a
+ * port, so a broken install (issue #161: tarball without console/dist/)
+ * is diagnosable in one command.
  */
 async function dispatch(args = [], ctx = {}) {
+  if (args.includes('--help') || args.includes('-h')) {
+    process.stdout.write(UI_USAGE);
+    try {
+      process.stdout.write(`console root: ${ctx.consoleRoot || resolveConsoleRoot()}\n`);
+    } catch (err) {
+      process.stdout.write(`console root: unavailable (${err.message ?? err})\n`);
+    }
+    return 0;
+  }
   try {
     await startServer({
       args,
@@ -660,6 +732,8 @@ module.exports = {
     handlePostRestart,
     handleGetStatus,
     openBrowser,
+    isCompiledBinary,
+    statusCommand,
     PORT_RANGE_START,
     PORT_RANGE_END,
   },
