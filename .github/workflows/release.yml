@@ -15,7 +15,10 @@ name: Release
 # Bot-loop guard: bump commits carry [skip ci]. Push of those commits is
 # filtered out by the prepare gate, so the bot's own push does not retrigger.
 #
-# Auth: npm OIDC Trusted Publishing (configured via build-all-platforms.yml).
+# Nothing here publishes to npm: that stopped at v3.0.0 (see version.yml).
+# The npmjs.com Trusted Publisher entry still configured for the legacy
+# `pgserve` package is unused. Distribution is GitHub Releases, signed by
+# sign-attest.yml with cosign keyless OIDC.
 
 on:
   push:
@@ -43,11 +46,6 @@ permissions:
                     # default GITHUB_TOKEN gets HTTP 403 "Resource not
                     # accessible by integration" (Bug #3 follow-up: the
                     # dispatch step failed for v3.0.3 with exactly this).
-  id-token: write   # required so the reusable `version.yml` workflow can mint
-                    # the OIDC token for npm Trusted Publishing — without this,
-                    # GH rejects the workflow at parse time (startup_failure)
-                    # because the called job's `id-token: write` permission
-                    # exceeds what the caller has granted.
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -108,6 +106,11 @@ jobs:
       # tag. workflow_dispatch is NOT subject to skip-ci, GITHUB_TOKEN is
       # permitted to start it, and `--ref ${TAG}` makes every job in the
       # chain check out the tagged tree. `[skip ci]` stays intact.
+      #
+      # `release=true` tells build-tarballs to keep going: it dispatches
+      # sign-attest, which dispatches release-publish. Those two hops are
+      # explicit for the same reason this one is — no `workflow_run` event
+      # is raised for a run GITHUB_TOKEN started.
       - name: Kick build-tarballs for the tag (skip-ci-immune)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -118,7 +121,8 @@ jobs:
           for i in 1 2 3 4 5; do
             if gh workflow run build-tarballs.yml \
                  --ref "${TAG}" \
-                 -f version="${VERSION}"; then
+                 -f version="${VERSION}" \
+                 -f release=true; then
               echo "Dispatched build-tarballs.yml @ ${TAG} (version=${VERSION})"
               exit 0
             fi
@@ -278,8 +282,9 @@ jobs:
       # V3-2 npm departure: the `publish` job that this workflow used to
       # call has been removed from version.yml. release.yml now only runs:
       #   bump (workflow_dispatch only) → prepare → build (sanity)
-      # The cosign-signed GitHub Releases pipeline runs independently via:
-      #   tag push → build-tarballs.yml → sign-attest.yml → release-publish.yml
+      # The cosign-signed GitHub Releases pipeline runs independently, each
+      # hop an explicit workflow_dispatch at the tag:
+      #   bump job → build-tarballs.yml → sign-attest.yml → release-publish.yml
       # See .genie/wishes/pgserve-singleton-no-proxy/SHARED-DESIGN.md
       # Decision #1 ("3.0 reserved for post-npm-departure cutover").
       #
@@ -291,8 +296,8 @@ jobs:
       # release-publish` chain → no GitHub Release.
       #
       # Workaround until a tag-creation step lands: route releases via
-      # workflow_dispatch (the bump job creates and pushes the tag,
-      # which then fires build-tarballs → sign-attest → release-publish).
+      # workflow_dispatch (the bump job creates and pushes the tag, then
+      # dispatches build-tarballs → sign-attest → release-publish).
       # This matches Felipe's current operational practice (all recent
       # v2.x releases were cut via workflow_dispatch, not push-to-main).
       ref: ${{ needs.prepare.outputs.ref }}
@@ -325,10 +330,9 @@ jobs:
   # route them through release-publish.
   #
   # Tag creation on the WORKFLOW_DISPATCH path is unaffected — the
-  # `bump` job creates and pushes the tag. release-publish.yml fires
-  # on `workflow_run` after sign-attest completes, picks up the tag
-  # via the upstream `workflow_run.head_branch`, and creates the
-  # GitHub Release with signed artifacts.
+  # `bump` job creates and pushes the tag. sign-attest.yml dispatches
+  # release-publish.yml at that tag once signing verifies, and
+  # release-publish creates the GitHub Release with signed artifacts.
   #
   # Tag creation on the PUSH path is NOT covered here anymore — see
   # known limitation in `build` job above. If push-to-main releases

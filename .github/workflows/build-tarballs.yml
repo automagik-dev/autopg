@@ -8,6 +8,10 @@ name: Build Tarballs (autopg)
 # SLSA attest) and Group 9 (CDN publish) can consume them in downstream
 # workflows.
 #
+# Release chain: build-tarballs → sign-attest → release-publish. Each hop is
+# an explicit `gh workflow run --ref <tag>` (see `kick-sign-attest` below),
+# never `workflow_run`.
+#
 # Matrix: 5 platforms — linux-x64-glibc, linux-x64-musl, linux-arm64,
 # darwin-x64, darwin-arm64. Each job runs the same three-stage pipeline:
 #
@@ -34,6 +38,11 @@ on:
         required: false
         type: string
         default: '18.3.0-beta.17'
+      release:
+        description: 'Continue the release chain (sign-attest, then a public release-publish) after the build'
+        required: false
+        type: boolean
+        default: false
   pull_request:
     paths:
       - 'scripts/build-binary.sh'
@@ -236,3 +245,65 @@ jobs:
             dist/build-record.tsv
           retention-days: 14
           if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Hand off to sign-attest — explicit dispatch, at the tag.
+  #
+  # This hop used to be a `workflow_run` trigger on sign-attest.yml. That can
+  # not work for a release:
+  #   1. release.yml starts this workflow with GITHUB_TOKEN, and GitHub raises
+  #      no follow-on events for a GITHUB_TOKEN-started run — sign-attest never
+  #      fired. Every release from v3.0.4 to v3.1.0 stalled here until someone
+  #      dispatched the next two workflows by hand; v3.1.0 sat unpublished for
+  #      17 days.
+  #   2. a `workflow_run` run executes at the default branch, so cosign would
+  #      sign as sign-attest.yml@refs/heads/main — an identity the consumer
+  #      trust regex in src/cosign/trust-list.js (…@refs/tags/v.*) rejects.
+  # `workflow_dispatch` is exempt from (1) and `--ref <tag>` fixes (2).
+  #
+  # Runs for tag pushes and for dispatches that ask for it (`release: true`,
+  # which release.yml passes). A plain manual rebuild of an old tag stops
+  # here, so it can not republish that version or move latest.json back.
+  # ---------------------------------------------------------------------------
+  kick-sign-attest:
+    name: Dispatch sign-attest at the tag
+    needs: [build]
+    if: github.ref_type == 'tag' && (github.event_name == 'push' || inputs.release)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write   # `gh workflow run` creates a workflow_dispatch event
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [[ -n "${{ inputs.version }}" ]]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(node -p "require('./package.json').version")
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch sign-attest.yml
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh workflow run sign-attest.yml \
+               --repo "${{ github.repository }}" \
+               --ref "${TAG}" \
+               -f version="${VERSION}" \
+               -f run_id="${{ github.run_id }}" \
+               -f publish=true; then
+            echo "::notice::dispatched sign-attest.yml @ ${TAG} (version=${VERSION}, run_id=${{ github.run_id }})"
+          else
+            echo "::error::could not dispatch sign-attest.yml — the release chain stops here. Recover with: gh workflow run sign-attest.yml --ref ${TAG} -f version=${VERSION} -f run_id=${{ github.run_id }} -f publish=true"
+            exit 1
+          fi

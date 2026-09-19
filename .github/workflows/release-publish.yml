@@ -5,14 +5,16 @@
 # is free, maintained by GitHub, and `gh attestation verify` reads cosign
 # signatures from Sigstore Rekor without any custom verification server.
 #
-# Trigger: runs after `sign-attest.yml` completes successfully (workflow_run)
-# OR on manual dispatch. The workflow_run trigger ensures the signing
-# artifacts exist BEFORE release-publish attempts to attach them — closes
-# the race window that previously shipped releases with no signing siblings.
+# Trigger: workflow_dispatch only. For a release, sign-attest.yml's
+# `kick-release-publish` job dispatches this once signing has verified, passing
+# its own run id as `sign_run_id` — so the signing artifacts always exist
+# BEFORE release-publish attempts to attach them. There is no `workflow_run`
+# trigger: it never fired after a GITHUB_TOKEN-started sign-attest run, which
+# left tagged versions unpublished.
 #
 # Pipeline:
-#   1. Download `autopg-signed-bundle-<version>` aggregate artifact from
-#      sign-attest.yml's upstream workflow_run (contains tarballs + sha256 +
+#   1. Download `autopg-signed-bundle-<version>` aggregate artifact from the
+#      sign-attest.yml run named by `sign_run_id` (contains tarballs + sha256 +
 #      sig + cert + intoto.jsonl + manifest.json — everything in one fetch)
 #   2. Sanity-check: every tarball must have its sig + cert + intoto.jsonl
 #      + sha256 siblings before any release upload happens
@@ -36,12 +38,6 @@
 name: release-publish
 
 on:
-  workflow_run:
-    workflows: ["Sign + Attest Tarballs (autopg)"]
-    types: [completed]
-    # No `branches:` filter — let workflow_run fire on every successful
-    # sign-attest run, including tag refs (Wave A PR-A1 Mismatch 5 fix
-    # mirror — same logic as sign-attest.yml's own trigger).
   workflow_dispatch:
     inputs:
       version:
@@ -53,8 +49,7 @@ on:
           run that produced the autopg-signed-bundle-<version> artifact.
           Find it via:
             gh run list --workflow "Sign + Attest Tarballs (autopg)" --limit 5
-          REQUIRED for manual dispatch — there's no automatic upstream
-          run-id resolution outside the workflow_run trigger path.
+          sign-attest.yml fills this in when it dispatches a release.
         required: true
       channel:
         description: 'Release channel'
@@ -94,30 +89,15 @@ jobs:
     name: Publish to GitHub Releases
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # On workflow_run trigger only fire if the upstream sign-attest run
-    # succeeded. workflow_dispatch path has no upstream and falls through.
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          # On workflow_run, the head_sha is the commit sign-attest ran
-          # against; use it so latest.json updates happen on the right ref.
-          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
 
       - name: Resolve version
         id: ver
-        env:
-          # workflow_run carries the upstream's head_branch which is the
-          # tag name (e.g. `v2.6.4`) for tag-triggered runs.
-          UPSTREAM_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
           if [ -n "${{ inputs.version }}" ]; then
             echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
-          elif [ -n "${UPSTREAM_BRANCH}" ]; then
-            # workflow_run: strip leading `v` if present
-            echo "version=${UPSTREAM_BRANCH#v}" >> "$GITHUB_OUTPUT"
           else
-            # Manual dispatch fallback: read package.json
             VER=$(node -p "require('./package.json').version")
             echo "version=${VER}" >> "$GITHUB_OUTPUT"
           fi
@@ -144,10 +124,8 @@ jobs:
           name: autopg-signed-bundle-${{ steps.ver.outputs.version }}
           path: dist/
           # Cross-workflow downloads need the upstream run-id +
-          # github-token. workflow_run gives us the run-id for free
-          # (github.event.workflow_run.id); manual dispatch operators
-          # must supply it via the `sign_run_id` input.
-          run-id: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.sign_run_id }}
+          # github-token; the run-id arrives as the `sign_run_id` input.
+          run-id: ${{ inputs.sign_run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: List release assets
@@ -261,6 +239,13 @@ jobs:
               ;;
           esac
 
+          # Commit on top of main's current tip, not this run's checkout. The
+          # run is checked out at the release tag, and by the time a release
+          # is published main may have moved past it — pushing a child of the
+          # tag to main would then be rejected as non-fast-forward.
+          git fetch --no-tags --depth=1 origin main
+          git switch --detach FETCH_HEAD
+
           mkdir -p .well-known
           for manifest_channel in "${!MANIFEST_FILES[@]}"; do
             FILE="${MANIFEST_FILES[$manifest_channel]}"
@@ -295,4 +280,9 @@ jobs:
           fi
           MANIFEST_LIST=$(IFS=','; echo "${!MANIFEST_FILES[*]}")
           git commit -m "chore(release): update manifests (${MANIFEST_LIST}) → v${VERSION}"
-          git push origin HEAD:main || echo "::warning::push failed (likely permission); update ${MANIFEST_PATHS[*]} manually"
+          # A release whose manifest never lands is invisible to install.sh
+          # and `autopg update`, so this must not pass quietly.
+          if ! git push origin HEAD:main; then
+            echo "::error::v${VERSION} is published, but pushing ${MANIFEST_PATHS[*]} to main failed — update it manually or install.sh + autopg update keep resolving the previous version"
+            exit 1
+          fi
