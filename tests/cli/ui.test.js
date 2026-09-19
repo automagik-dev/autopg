@@ -235,6 +235,60 @@ describe('PUT /api/settings', () => {
   });
 });
 
+describe('POST /api/restart', () => {
+  function fakeResponse() {
+    const res = { status: null, body: null };
+    res.writeHead = (status) => {
+      res.status = status;
+    };
+    res.end = (body) => {
+      res.body = JSON.parse(body);
+    };
+    return res;
+  }
+
+  test('waits for the async restart and answers 200 once it is ready', async () => {
+    const { handlePostRestart } = freshUi()._internals;
+    const res = fakeResponse();
+    let settled = false;
+    const restartDispatch = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      settled = true;
+      return 0;
+    };
+
+    await handlePostRestart({}, res, { restartDispatch });
+
+    expect(settled).toBe(true);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true });
+  });
+
+  test('answers 500 RESTART_FAILED when the restart never becomes ready', async () => {
+    const { handlePostRestart } = freshUi()._internals;
+    const res = fakeResponse();
+
+    await handlePostRestart({}, res, { restartDispatch: async () => 1 });
+
+    expect(res.status).toBe(500);
+    expect(res.body.error.code).toBe('RESTART_FAILED');
+    expect(res.body.error.message).toBe('restart exited with code 1');
+  });
+
+  test('answers 500 RESTART_FAILED when the restart rejects', async () => {
+    const { handlePostRestart } = freshUi()._internals;
+    const res = fakeResponse();
+    const restartDispatch = async () => {
+      throw new Error('pm2 exploded');
+    };
+
+    await handlePostRestart({}, res, { restartDispatch });
+
+    expect(res.status).toBe(500);
+    expect(res.body.error.message).toBe('pm2 exploded');
+  });
+});
+
 describe('static file serving', () => {
   test('serves index.html when console/index.html exists', async () => {
     // Inject a temp consoleRoot with a marker file so we don't depend on

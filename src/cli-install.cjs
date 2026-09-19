@@ -27,6 +27,12 @@ const fs = require('node:fs');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
+const {
+  PM2_PROCESS_NAME,
+  evaluateServiceState,
+  formatServiceState,
+  waitForServiceReadiness,
+} = require('./lib/service-state.cjs');
 
 // pgserve v2.6.1 — `pgserve install --help` should print usage + exit 0,
 // not run the install (B2 HIGH from QA-RECIPE-B2.md). Single source of
@@ -196,7 +202,6 @@ function getCurrentVersion() {
 //
 // Default postgres port moves from 8432 (the old bun-proxy listener) to 5432
 // (the postgres standard, since the postmaster now binds TCP directly).
-const PM2_PROCESS_NAME = 'autopg-server';
 // Legacy entry name (pre-v2.4). Self-healing migration in Group 6 will
 // `pm2 delete pgserve` after registering `autopg-server`; we surface the
 // constant here so cleanup tooling and tests can reference it without
@@ -460,6 +465,19 @@ function pm2GetProcess(name) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Port the registered pm2 entry launches the postmaster on — the `--port`
+ * arg from `buildPm2StartArgs`, which pm2 keeps and replays on every
+ * `pm2 start <name>` / `pm2 restart <name>`. Null when pm2 doesn't expose it.
+ */
+function pm2RegisteredPort(proc) {
+  const procArgs = proc?.pm2_env?.args;
+  if (!Array.isArray(procArgs)) return null;
+  const i = procArgs.lastIndexOf('--port');
+  const value = i >= 0 ? Number.parseInt(procArgs[i + 1], 10) : Number.NaN;
+  return Number.isInteger(value) ? value : null;
 }
 
 function pm2IsAvailable() {
@@ -890,7 +908,32 @@ async function cmdInstall(args, ctx) {
     fail('pm2 not found in PATH. Install with: bun add -g pm2  (or npm i -g pm2). Pass --no-pm2 for CI / Tier B-bound hosts.');
   }
 
-  const port = parsePort(args) ?? readConfig()?.port ?? DEFAULT_PORT;
+  const noUi = args.includes('--no-ui');
+  const withUi = args.includes('--with-ui');
+  const redeploy = args.includes('--redeploy');
+  const existingBeforeInstall = pm2GetProcess(PM2_PROCESS_NAME);
+  // Port the registered postmaster really runs on. pm2 replays the args it
+  // was started with, so those win; admin.json and config.json cover entries
+  // that don't expose them.
+  const registeredPort = existingBeforeInstall
+    ? pm2RegisteredPort(existingBeforeInstall) ?? readAdminJsonSync()?.port ?? readConfig()?.port ?? null
+    : null;
+  const requestedPort = parsePort(args);
+  // Without --redeploy the live process is kept, so a different `--port`
+  // can't take effect. Refuse before anything is written: rewriting
+  // config.json/admin.json to a port the postmaster is not on would fail the
+  // readiness wait below and every later `restart`.
+  if (!redeploy && registeredPort != null && requestedPort != null && requestedPort !== registeredPort) {
+    fail(
+      `pm2 process "${PM2_PROCESS_NAME}" is already installed on port ${registeredPort}; `
+      + `re-run with \`--redeploy\` to move it to port ${requestedPort}`,
+    );
+  }
+  const port = requestedPort ?? registeredPort ?? readConfig()?.port ?? DEFAULT_PORT;
+  // Our own postmaster already holds its port, so the bind test would only
+  // see ourselves. Any other port — including a `--redeploy` to a new one —
+  // still gets tested while the old postmaster is alive to fall back on.
+  const portHeldByUs = existingBeforeInstall && (registeredPort == null || registeredPort === port);
 
   // B3 (v2.6.1): pre-flight bind-test the chosen port BEFORE creating
   // pm2 entries / admin.json / data dir. Without this, an operator on
@@ -898,7 +941,7 @@ async function cmdInstall(args, ctx) {
   // while the postmaster crashes silently — divergence between
   // supervisor state and data-plane state. Fail fast with a clear hint.
   try {
-    await assertPortAvailable(port);
+    if (!withUi && !portHeldByUs) await assertPortAvailable(port);
   } catch (err) {
     if (err.code === 'EADDRINUSE') {
       process.stderr.write(`${err.message}\n`);
@@ -938,9 +981,6 @@ async function cmdInstall(args, ctx) {
     fail(err.message);
   }
 
-  const noUi = args.includes('--no-ui');
-  const withUi = args.includes('--with-ui');
-  const redeploy = args.includes('--redeploy');
   const uiPort = parseUiPort(args) ?? DEFAULT_UI_PORT;
   const uiHost = parseUiHost(args) ?? DEFAULT_UI_HOST;
 
@@ -990,12 +1030,25 @@ async function cmdInstall(args, ctx) {
   // even on hosts where the daemon was registered pre-v2.2.3.
   const existing = redeploy ? null : pm2GetProcess(PM2_PROCESS_NAME);
   if (existing) {
-    ok(`already installed (pm2 process "${PM2_PROCESS_NAME}", status=${existing.pm2_env?.status ?? 'unknown'})`);
+    if (existing.pm2_env?.status !== 'online') {
+      const startResult = spawnSync('pm2', ['start', PM2_PROCESS_NAME], { stdio: 'inherit' });
+      if (startResult.status !== 0) {
+        fail(`pm2 start failed (exit ${startResult.status}). Logs: ${getLogsDir()}/${PM2_PROCESS_NAME}-error.log`);
+      }
+    }
     // Refresh config in case install was re-run with new flags — but
     // don't tear down the live process. Operators wanting a port change
     // should `uninstall` then `install` (or pass --redeploy).
     writeConfig({ port, dataDir, registeredAt: readConfig()?.registeredAt ?? new Date().toISOString() });
     writeSupervisorRecord(adminJson, { supervisor: 'pm2', socketDir, port });
+    const state = await waitForServiceReadiness();
+    if (!state.ready) {
+      fail(
+        `pm2 process "${PM2_PROCESS_NAME}" did not become ready: ${formatServiceState(state)}. `
+        + `Logs: ${getLogsDir()}/${PM2_PROCESS_NAME}-error.log`,
+      );
+    }
+    ok(`already installed and ready (pm2 process "${PM2_PROCESS_NAME}")`);
     if (!noUi) cmdInstallUi(ctx, { uiPort, uiHost });
     return 0;
   }
@@ -1011,7 +1064,14 @@ async function cmdInstall(args, ctx) {
 
   writeConfig({ port, dataDir, registeredAt: new Date().toISOString() });
   writeSupervisorRecord(adminJson, { supervisor: 'pm2', socketDir, port });
-  ok(`installed: pm2 process "${PM2_PROCESS_NAME}" on port ${port} (socket: ${socketDir}, data: ${dataDir})`);
+  const state = await waitForServiceReadiness();
+  if (!state.ready) {
+    fail(
+      `pm2 process "${PM2_PROCESS_NAME}" did not become ready: ${formatServiceState(state)}. `
+      + `Logs: ${getLogsDir()}/${PM2_PROCESS_NAME}-error.log`,
+    );
+  }
+  ok(`installed and ready: pm2 process "${PM2_PROCESS_NAME}" on port ${port} (socket: ${socketDir}, data: ${dataDir})`);
   ok(`url: postgres://localhost:${port}/postgres`);
 
   if (noUi) {
@@ -1086,7 +1146,10 @@ function cmdStatus(args) {
   }
 
   const proc = pm2GetProcess(PM2_PROCESS_NAME);
-  const status = proc?.pm2_env?.status ?? 'stopped';
+  const supervisor = admin?.supervisor ?? (proc ? 'pm2' : null);
+  const supervisorStatus = supervisor === 'pm2'
+    ? proc?.pm2_env?.status ?? 'missing'
+    : supervisor;
   const pid = proc?.pid ?? null;
   const uptimeMs = proc?.pm2_env?.pm_uptime ? Date.now() - proc.pm2_env.pm_uptime : null;
   const restarts = proc?.pm2_env?.restart_time ?? 0;
@@ -1094,11 +1157,21 @@ function cmdStatus(args) {
   const port = discovery.port;
   const socketDir = discovery.socketDir;
   const dataDir = config?.dataDir ?? null;
+  const serviceState = evaluateServiceState({
+    supervisor,
+    supervisorStatus,
+    supervisorPid: pid,
+    configuredPort: port,
+    runtime,
+    runtimeLive: discovery.liveAutopg,
+  });
 
   const payload = {
     installed: true,
     name: PM2_PROCESS_NAME,
-    status,
+    status: serviceState.status,
+    ready: serviceState.ready,
+    supervisorStatus,
     pid,
     port,
     socketDir,
@@ -1108,7 +1181,7 @@ function cmdStatus(args) {
     uptimeMs,
     restarts,
     registeredAt: config?.registeredAt ?? null,
-    supervisor: admin?.supervisor ?? null,
+    supervisor,
     runtime: runtime
       ? {
           socketDir: runtime.socketDir,
@@ -1128,7 +1201,7 @@ function cmdStatus(args) {
   process.stdout.write(`name        ${payload.name}\n`);
   process.stdout.write(`status      ${payload.status}${payload.pid ? ` (pid ${payload.pid})` : ''}\n`);
   if (payload.supervisor) {
-    process.stdout.write(`supervisor  ${payload.supervisor}\n`);
+    process.stdout.write(`supervisor  ${payload.supervisor} (${payload.supervisorStatus})\n`);
   }
   if (payload.port != null) process.stdout.write(`port        ${payload.port}\n`);
   if (payload.url) process.stdout.write(`url         ${payload.url}\n`);

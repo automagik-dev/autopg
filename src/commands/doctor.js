@@ -38,6 +38,7 @@ import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 
 const require = createRequire(import.meta.url);
+const { PM2_PROCESS_NAME } = require('../lib/service-state.cjs');
 import { getAdminFilePath, readAdminJson, SUPERVISOR_VALUES } from '../lib/admin-json.js';
 import { resolveSocketDir } from '../lib/socket-dir.js';
 import { readRuntimeJson, isLiveRuntime } from '../lib/runtime-json.js';
@@ -259,7 +260,7 @@ function checkSupervisorLiveness(admin) {
   }
   switch (admin.supervisor) {
     case 'pm2': {
-      const r = pm2EntryOnline('autopg-server');
+      const r = pm2EntryOnline(PM2_PROCESS_NAME);
       return r.ok
         ? check('supervisor_liveness', 'pm2 autopg-server entry online', SEVERITY.PASS)
         : check('supervisor_liveness', 'pm2 autopg-server entry not online', SEVERITY.FAIL, r.reason, 'run `pgserve install` to (re-)register pm2 entry');

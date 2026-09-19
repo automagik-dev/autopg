@@ -36,6 +36,10 @@ function makeStubPm2() {
   // (and exits non-zero when the sentinel is missing — pm2's real behavior
   // for `pm2 delete <missing>` — to verify the uninstall path treats that
   // as idempotent).
+  //
+  // `install` only succeeds once the service is ready, so a `start` of the
+  // postmaster also publishes `<socketDir>/runtime.json` owned by the live
+  // pid `jlist` reports — what the real supervised postmaster does.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'autopg-stub-pm2-'));
   const callLog = path.join(dir, 'calls.log');
   const script = `#!/usr/bin/env node
@@ -50,6 +54,7 @@ if (args[0] === '--version') {
 }
 
 const dir = ${JSON.stringify(dir)};
+const livePid = Number(process.env.AUTOPG_TEST_LIVE_PID) || 12345;
 function sentinelOf(name) { return path.join(dir, 'registered-' + name); }
 
 if (args[0] === 'jlist') {
@@ -59,7 +64,7 @@ if (args[0] === 'jlist') {
     const name = f.slice('registered-'.length);
     out.push({
       name,
-      pid: 12345,
+      pid: livePid,
       pm2_env: { status: 'online', pm_uptime: Date.now() - 1000, restart_time: 0 },
     });
   }
@@ -72,6 +77,19 @@ if (args[0] === 'start') {
   const i = args.indexOf('--name');
   const name = i >= 0 ? args[i + 1] : 'unknown';
   fs.writeFileSync(sentinelOf(name), '');
+  const socketIndex = args.lastIndexOf('--socket-dir');
+  const portIndex = args.lastIndexOf('--port');
+  if (socketIndex >= 0 && portIndex >= 0) {
+    const socketDir = args[socketIndex + 1];
+    fs.mkdirSync(socketDir, { recursive: true });
+    fs.writeFileSync(path.join(socketDir, 'runtime.json'), JSON.stringify({
+      socketDir,
+      port: Number(args[portIndex + 1]),
+      pid: livePid,
+      autopgPid: livePid,
+      schemaVersion: 1,
+    }));
+  }
   process.exit(0);
 }
 
@@ -106,6 +124,10 @@ function runCli(args, env = {}) {
     env: {
       ...process.env,
       AUTOPG_CONFIG_DIR: tmpHome,
+      // Keep the socket dir (and the stub's runtime.json) inside the test's
+      // tempdir instead of the host's canonical /tmp/pgserve.
+      XDG_RUNTIME_DIR: path.join(tmpHome, 'runtime'),
+      AUTOPG_TEST_LIVE_PID: String(process.pid),
       PATH: `${stubBin.dir}:${process.env.PATH}`,
       // Skip the B3 port-preflight (v2.6.1) so tests that don't pin a
       // free `--port` don't race host-level services on 5432. Tests

@@ -134,10 +134,10 @@ autopg [options]                       # foreground server (alias: pgserve)
 autopg daemon                          # long-lived background daemon
 autopg install [--port N] [--data P]   # register pgserve under pm2
 autopg uninstall [--yes]               # remove from pm2 (data dir kept); confirms first
-autopg status                          # pm2 + on-disk config snapshot
+autopg status                          # readiness + pm2 state + on-disk config snapshot
 autopg url | autopg port               # canonical connection string / port
 autopg config <list|get|set|edit|path|init>   # manage ~/.autopg/settings.json
-autopg restart                         # pm2-aware: pm2 restart pgserve, else SIGTERM+respawn
+autopg restart                         # restart autopg-server; succeeds only when PostgreSQL is ready
 autopg ui [--port N] [--no-open]       # local web console on 127.0.0.1
 ```
 
@@ -253,9 +253,15 @@ autopg install --data /data/pg    # custom data dir
 
 autopg url                        # postgres://localhost:8432/postgres
 autopg port                       # 8432
-autopg status                     # pm2 + on-disk config snapshot
+autopg status                     # readiness + pm2 state + on-disk config snapshot
 autopg uninstall                  # remove from pm2; keep data dir (prompts; --yes for scripts)
 ```
+
+`autopg status --json` reports readiness, not just the pm2 state: `status` is
+`ready`, `degraded`, `stopped` or `failed`, and `ready` is `true` only when pm2
+is online **and** the live postmaster matches the configured port. The raw pm2
+state (`online`, `stopped`, `errored`) moved to `supervisorStatus` — scripts that
+compared `status` to `online` should read `ready` instead.
 
 **Hardened defaults** (tuned for production-grade Postgres workloads,
 not toy-machine values):
