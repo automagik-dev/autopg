@@ -14,7 +14,8 @@
 #   --real        Smoke the real dist/ output produced by the build
 #                 matrix. Requires that scripts/build-binary.sh and
 #                 scripts/fetch-postgres-bins.sh have already run
-#                 against the requested --platform.
+#                 against the requested --platform. Also boots the
+#                 shipped console (`autopg ui`) and curls it.
 #
 # Exit codes:
 #   0  pass
@@ -107,11 +108,69 @@ EOF
   chmod +x "${stage}/postgres/bin/initdb"
 
   echo 'fixture-timezone-data' > "${stage}/postgres/share/timezone.txt"
+
+  # Console stub: assemble-tarball.sh ships $AUTOPG_CONSOLE_DIST as
+  # autopg/console/dist/ and would otherwise `bun run console:build`, which
+  # this mode must not need (no bun / node_modules on the fixture runner).
+  local console_stub="${DIST_DIR:?}/${PLATFORM:?}/console-fixture"
+  mkdir -p "$console_stub"
+  echo '<!doctype html><title>autopg console (fixture stub)</title>' > "${console_stub}/index.html"
+  echo '/* fixture stub */' > "${console_stub}/app.js"
+  export AUTOPG_CONSOLE_DIST="$console_stub"
 }
 
 run_assemble() {
   bash "${REPO_ROOT}/scripts/assemble-tarball.sh" \
     --platform "$PLATFORM" --version "$VERSION"
+}
+
+# Pick a free loopback TCP port (node is already a dependency of this script).
+free_port() {
+  node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{process.stdout.write(String(s.address().port));s.close()})'
+}
+
+# --real only: boot the console out of the extracted tree and prove it
+# serves — this is the operator-visible symptom of issue #161 (the v3.2.0
+# tarball had no console/dist/, so `autopg ui` died on "console assets not
+# found" and `autopg install` skipped the autopg-ui pm2 process).
+assert_console_serves() {
+  local root="$1" scratch="$2"
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "    - curl not found; skipping console serve check"
+    return 0
+  fi
+
+  local cfg="${scratch}/config" log="${scratch}/ui.log" port
+  mkdir -p "$cfg"
+  port=$(free_port)
+
+  AUTOPG_CONFIG_DIR="$cfg" "${root}/autopg" ui --no-open --port "$port" >"$log" 2>&1 &
+  local pid=$!
+
+  # Bounded wait (~10s) for the listener; the binary boots in well under 1s.
+  local code="" attempts=50
+  while (( attempts-- > 0 )); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${port}/" 2>/dev/null || true)
+    [[ "$code" == "200" || "$code" == "401" ]] && break
+    sleep 0.2
+  done
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+
+  # 401 = Basic Auth challenge in front of the console (no admin.json in the
+  # scratch config dir); 200 would mean auth is disabled. Anything else means
+  # the console never came up — dump the log for the CI transcript.
+  if [[ "$code" == "401" || "$code" == "200" ]]; then
+    ok "autopg ui serves the console from the tarball (HTTP ${code})"
+  else
+    fail "autopg ui did not serve the console (last HTTP code: '${code}')"
+    sed 's/^/      | /' "$log" >&2
+  fi
+  if grep -q 'console assets not found' "$log"; then
+    fail "autopg ui printed 'console assets not found'"
+  else
+    ok "autopg ui found the console assets"
+  fi
 }
 
 assert_outputs() {
@@ -144,6 +203,8 @@ assert_outputs() {
   for required in \
       autopg/autopg \
       autopg/postgres/bin/postgres \
+      autopg/console/dist/index.html \
+      autopg/console/dist/app.js \
       autopg/manifest.json; do
     [[ -e "${scratch}/${required}" ]] && ok "tarball contains: ${required}" \
                                        || fail "tarball missing: ${required}"
@@ -172,6 +233,25 @@ assert_outputs() {
     fail "postgres binary not executable"
   fi
 
+  # --real: the compiled binary must resolve the console next to itself
+  # (a non-serving probe: `ui --help` prints usage + the resolved root),
+  # then actually serve it. The fixture's `autopg` is a shell stub that
+  # knows only --version, so both checks are real-mode only.
+  if [[ "$MODE" == "real" ]]; then
+    # process.execPath is symlink-resolved (macOS: /var → /private/var), so
+    # compare against the physical scratch path.
+    local scratch_real help_out
+    scratch_real=$(cd "$scratch" && pwd -P)
+    help_out=$("${scratch}/autopg/autopg" ui --help 2>&1 || true)
+    if echo "$help_out" | grep -q "console root: ${scratch_real}/autopg/console/dist"; then
+      ok "autopg ui --help resolves console root next to the binary"
+    else
+      fail "autopg ui --help did not resolve the shipped console root"
+      echo "$help_out" | sed 's/^/      | /' >&2
+    fi
+    assert_console_serves "${scratch}/autopg" "$scratch"
+  fi
+
   # manifest.json sanity
   local manifest="${scratch}/autopg/manifest.json"
   if [[ -f "$manifest" ]]; then
@@ -182,6 +262,13 @@ assert_outputs() {
                                 || fail "manifest.platform drift: ${pf}"
     [[ "$ver" == "$VERSION" ]]  && ok "manifest.version == ${VERSION}" \
                                 || fail "manifest.version drift: ${ver}"
+
+    # the console must be covered by the per-file hashes (it is served to
+    # a browser; an unlisted file would escape cosign's attestation)
+    local console_listed
+    console_listed=$(node -p "require('${manifest}').files.some((f) => f.path === 'autopg/console/dist/index.html')" 2>/dev/null || echo "false")
+    [[ "$console_listed" == "true" ]] && ok "manifest lists autopg/console/dist/index.html" \
+                                      || fail "manifest does not list autopg/console/dist/index.html"
 
     # spot-check one per-file SHA from the manifest
     local first_path first_sha
