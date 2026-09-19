@@ -27,6 +27,11 @@ import {
   pgvectorDebUrl,
   resolvePgvectorDebVersions,
 } from './pgvector-version.js';
+import { createBoundedTail, drainStream } from './lib/drain-stream.js';
+
+// How much of postgres's stdout/stderr is kept for startup-failure and crash
+// diagnostics. Both only need the end of the output.
+const STARTUP_OUTPUT_TAIL_CHARS = 64 * 1024;
 
 /**
  * Get platform key for binary lookup (e.g., 'windows-x64', 'linux-x64', 'darwin-arm64')
@@ -978,7 +983,10 @@ export class PostgresManager extends EventEmitter {
       });
 
       let started = false;
-      let startupOutput = '';
+      // Diagnostics only ever need the end of postgres's output. Bounded: with
+      // log_statement=all this stream carries every query for the life of the
+      // server, and an unbounded buffer grew until allocation failed (#149).
+      const startupOutput = createBoundedTail(STARTUP_OUTPUT_TAIL_CHARS);
       let processExited = false;
       let portBindingSeen = false;
       const portStr = this.port.toString();
@@ -999,37 +1007,41 @@ export class PostgresManager extends EventEmitter {
       };
 
       // Read stderr - detect port binding in logs (locale-independent: just look for port number)
-      const readStream = async (stream) => {
-        const reader = stream.getReader();
-        const decoder = new TextDecoder();
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            const message = decoder.decode(value);
-            startupOutput += message;
-            this.logger.debug({ pgOutput: message.trim() }, 'PostgreSQL output');
+      //
+      // These pipes must be drained for as long as postgres lives: if the
+      // read loop stops, the pipe fills and every backend blocks on its next
+      // log write — the whole database hangs with both processes still alive
+      // (#149). drainStream keeps reading whatever the handler below throws.
+      const readStream = (stream, name) => drainStream(stream, {
+        onChunk: (message) => {
+          startupOutput.append(message);
+          this.logger.debug({ pgOutput: message.trim() }, 'PostgreSQL output');
 
-            // Detect port binding - look for our port number in log output
-            // This is locale-independent (numbers are universal)
-            if (!portBindingSeen && message.includes(portStr)) {
-              portBindingSeen = true;
-              // Give PostgreSQL 500ms after port binding to finish startup
-              setTimeout(() => {
-                if (!started && !processExited) {
-                  markReady('log-port-binding');
-                }
-              }, 500);
-            }
+          // Detect port binding - look for our port number in log output
+          // This is locale-independent (numbers are universal)
+          if (!portBindingSeen && message.includes(portStr)) {
+            portBindingSeen = true;
+            // Give PostgreSQL 500ms after port binding to finish startup
+            setTimeout(() => {
+              if (!started && !processExited) {
+                markReady('log-port-binding');
+              }
+            }, 500);
           }
-        } catch {
-          // Stream closed
-        }
-      };
+        },
+        onError: (error, phase) => {
+          const detail = { stream: name, phase, err: error?.message ?? String(error) };
+          if (phase === 'read' && !processExited) {
+            this.logger?.error(detail, 'PostgreSQL output stream broke while postgres is running — it is no longer drained and postgres may block on its next log write');
+          } else if (phase === 'chunk') {
+            this.logger?.error(detail, 'Failed to handle PostgreSQL output; still draining');
+          }
+        },
+      });
 
       // Start reading both streams
-      readStream(this.process.stderr);
-      readStream(this.process.stdout);
+      readStream(this.process.stderr, 'stderr');
+      readStream(this.process.stdout, 'stdout');
 
       // Handle process exit
       //
@@ -1046,7 +1058,7 @@ export class PostgresManager extends EventEmitter {
         processExited = true;
         const expected = !!this._stopping;
         if (!started) {
-          reject(new Error(`PostgreSQL exited with code ${code} before starting: ${startupOutput}`));
+          reject(new Error(`PostgreSQL exited with code ${code} before starting: ${startupOutput.toString()}`));
         }
         this.process = null;
         // On unexpected exit (not via stop()), reset cached paths so that
@@ -1067,9 +1079,7 @@ export class PostgresManager extends EventEmitter {
           // output captured' so the field stays present in structured
           // logs).
           const STDERR_TAIL_BUDGET = 4096;
-          const tail = startupOutput.length > STDERR_TAIL_BUDGET
-            ? startupOutput.slice(-STDERR_TAIL_BUDGET)
-            : startupOutput;
+          const tail = startupOutput.toString().slice(-STDERR_TAIL_BUDGET);
           this.logger?.warn(
             { code, postgresStderrTail: tail.trim() || 'no postgres output captured' },
             'PostgreSQL subprocess exited unexpectedly — socketDir/databaseDir reset'
@@ -1169,7 +1179,7 @@ export class PostgresManager extends EventEmitter {
           const hint = isWindows
             ? '\n\nOn Windows, this may be caused by Windows Firewall blocking localhost connections.\nTry: netsh advfirewall firewall add rule name="pgserve" dir=in action=allow protocol=TCP localport=' + this.port
             : '';
-          reject(new Error(`PostgreSQL startup timed out after 30s.${hint}\n\nOutput: ${startupOutput}`));
+          reject(new Error(`PostgreSQL startup timed out after 30s.${hint}\n\nOutput: ${startupOutput.toString()}`));
         }
       }, 30000);
     });
