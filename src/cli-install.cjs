@@ -33,7 +33,11 @@ const {
   formatServiceState,
   waitForServiceReadiness,
 } = require('./lib/service-state.cjs');
-const { inspectPm2Persistence, persistPm2Registrations } = require('./lib/pm2-persistence.cjs');
+const {
+  describePm2Persistence,
+  inspectPm2Persistence,
+  persistPm2Registrations,
+} = require('./lib/pm2-persistence.cjs');
 
 // pgserve v2.6.1 — `pgserve install --help` should print usage + exit 0,
 // not run the install (B2 HIGH from QA-RECIPE-B2.md). Single source of
@@ -881,7 +885,7 @@ function persistPm2Install({ noSave }) {
       .map((name) => inspectPm2Persistence(name))
       .filter((state) => !state.persisted);
     for (const state of unsaved) {
-      note(`WARNING: --no-save: ${state.reason}; it will not survive \`pm2 resurrect\` until you run \`pm2 save\``);
+      note(`WARNING: --no-save: ${describePm2Persistence(state)}; fix it with \`pm2 save\``);
     }
     return;
   }

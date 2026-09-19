@@ -39,7 +39,7 @@ import { spawnSync } from 'node:child_process';
 
 const require = createRequire(import.meta.url);
 const { PM2_PROCESS_NAME } = require('../lib/service-state.cjs');
-const { inspectPm2Persistence } = require('../lib/pm2-persistence.cjs');
+const { describePm2Persistence, inspectPm2Persistence } = require('../lib/pm2-persistence.cjs');
 import { getAdminFilePath, readAdminJson, SUPERVISOR_VALUES } from '../lib/admin-json.js';
 import { resolveSocketDir } from '../lib/socket-dir.js';
 import { readRuntimeJson, isLiveRuntime } from '../lib/runtime-json.js';
@@ -299,15 +299,16 @@ function checkPm2Persistence(admin, options = {}) {
     return check('pm2_persistence', 'pm2 persistence (not supervised by pm2)', SEVERITY.PASS);
   }
   const state = inspectPm2Persistence(PM2_PROCESS_NAME, options);
-  return state.persisted
-    ? check('pm2_persistence', 'pm2 autopg-server entry is saved for `pm2 resurrect`', SEVERITY.PASS)
-    : check(
-        'pm2_persistence',
-        'pm2 autopg-server entry will not survive `pm2 resurrect`',
-        SEVERITY.FAIL,
-        state.reason,
-        'run `pm2 save` (or re-run `autopg install`, which saves it)',
-      );
+  if (state.persisted) {
+    return check('pm2_persistence', 'pm2 autopg-server entry is saved for `pm2 resurrect`', SEVERITY.PASS);
+  }
+  const title = state.kind === 'stale'
+    ? 'pm2 autopg-server entry is saved but not running'
+    : 'pm2 autopg-server entry will not survive `pm2 resurrect`';
+  const remedy = state.kind === 'stale'
+    ? 'run `pm2 save --force` (or `autopg uninstall`, which does) unless it should come back'
+    : 'run `pm2 save` (or re-run `autopg install`, which saves it)';
+  return check('pm2_persistence', title, SEVERITY.FAIL, describePm2Persistence(state), remedy);
 }
 
 function checkRuntimeJson(admin) {

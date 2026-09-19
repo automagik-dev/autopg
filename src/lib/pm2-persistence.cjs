@@ -81,35 +81,53 @@ function pm2GetProcess(name) {
 /**
  * Compare a live `pm2 jlist` entry with the dump. Pure: no I/O.
  *
- * @returns {{ persisted: boolean, reason: string|null, differences: string[] }}
+ * `kind` says which way they disagree, because the consequence differs:
+ *   unsaved    live but not saved — gone after the next resurrect
+ *   stale      saved but not live — comes back at the next resurrect
+ *   drift      both, with different settings — comes back with the saved ones
+ *   unreadable dump.pm2 could not be read
+ *
+ * @returns {{ persisted: boolean, kind: 'ok'|'unsaved'|'stale'|'drift'|'unreadable', reason: string|null, differences: string[] }}
  */
 function comparePm2Persistence(name, liveEntry, dump) {
   if (dump.error) {
-    return { persisted: false, reason: dump.error, differences: [] };
+    return { persisted: false, kind: 'unreadable', reason: dump.error, differences: [] };
   }
   const saved = dump.entries.find((entry) => entry.name === name) || null;
   if (!liveEntry) {
     return saved
-      ? { persisted: false, reason: `${name} is in dump.pm2 but not registered with pm2`, differences: [] }
-      : { persisted: true, reason: null, differences: [] };
+      ? { persisted: false, kind: 'stale', reason: `${name} is in dump.pm2 but not registered with pm2`, differences: [] }
+      : { persisted: true, kind: 'ok', reason: null, differences: [] };
   }
   if (!saved) {
     const reason = dump.exists
       ? `${name} is registered with pm2 but missing from dump.pm2`
       : `${name} is registered with pm2 but no dump.pm2 exists`;
-    return { persisted: false, reason, differences: [] };
+    return { persisted: false, kind: 'unsaved', reason, differences: [] };
   }
   const live = liveEntry.pm2_env || {};
   const differences = PERSISTED_FIELDS.filter(
     (field) => JSON.stringify(live[field] ?? null) !== JSON.stringify(saved[field] ?? null),
   );
   return differences.length === 0
-    ? { persisted: true, reason: null, differences }
+    ? { persisted: true, kind: 'ok', reason: null, differences }
     : {
         persisted: false,
+        kind: 'drift',
         reason: `${name} differs between pm2 and dump.pm2 (${differences.join(', ')})`,
         differences,
       };
+}
+
+/** One operator-facing sentence: what is wrong and what `pm2 resurrect` would do about it. */
+function describePm2Persistence(state) {
+  switch (state.kind) {
+    case 'unsaved': return `${state.reason}; it will not survive \`pm2 resurrect\``;
+    case 'stale': return `${state.reason}; the next \`pm2 resurrect\` will start it again`;
+    case 'drift': return `${state.reason}; \`pm2 resurrect\` would start it with the saved settings`;
+    case 'unreadable': return `pm2's saved process list is unreadable: ${state.reason}`;
+    default: return 'saved for `pm2 resurrect`';
+  }
 }
 
 function inspectPm2Persistence(name, { env = process.env, getProcess = pm2GetProcess } = {}) {
@@ -127,24 +145,35 @@ function inspectPm2Persistence(name, { env = process.env, getProcess = pm2GetPro
  *
  * @returns {{ saved: boolean, ok: boolean, reasons: string[] }}
  */
-function persistPm2Registrations(names, { env = process.env, getProcess = pm2GetProcess, save = pm2Save } = {}) {
+function persistPm2Registrations(names, {
+  env = process.env,
+  getProcess = pm2GetProcess,
+  save = pm2Save,
+  force = false,
+} = {}) {
   const pending = names
     .map((name) => inspectPm2Persistence(name, { env, getProcess }))
     .filter((state) => !state.persisted);
   if (pending.length === 0) return { saved: false, ok: true, reasons: [] };
 
-  const result = save();
+  const result = save({ force });
   if (!result.ok) {
     return { saved: false, ok: false, reasons: [`pm2 save failed: ${result.reason}`] };
   }
   const remaining = names
     .map((name) => inspectPm2Persistence(name, { env, getProcess }))
     .filter((state) => !state.persisted);
-  return { saved: true, ok: remaining.length === 0, reasons: remaining.map((state) => state.reason) };
+  return { saved: true, ok: remaining.length === 0, reasons: remaining.map(describePm2Persistence) };
 }
 
-function pm2Save() {
-  const result = spawnSync('pm2', ['save'], {
+/**
+ * `force`: plain `pm2 save` skips writing when pm2 manages no process at all
+ * ("PM2 is not managing any process, skipping save"), which is exactly the
+ * state after uninstalling the only app on a host — the stale entry would
+ * stay saved. `--force` writes the (empty) list anyway.
+ */
+function pm2Save({ force = false } = {}) {
+  const result = spawnSync('pm2', force ? ['save', '--force'] : ['save'], {
     encoding: 'utf8',
     timeout: 30_000,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -159,6 +188,7 @@ function pm2Save() {
 module.exports = {
   PERSISTED_FIELDS,
   comparePm2Persistence,
+  describePm2Persistence,
   getPm2DumpPath,
   inspectPm2Persistence,
   persistPm2Registrations,

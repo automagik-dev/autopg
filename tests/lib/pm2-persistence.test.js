@@ -5,6 +5,7 @@ import path from 'node:path';
 
 const {
   comparePm2Persistence,
+  describePm2Persistence,
   getPm2DumpPath,
   inspectPm2Persistence,
   persistPm2Registrations,
@@ -52,7 +53,15 @@ describe('comparePm2Persistence', () => {
 
   test('matching live and saved entries are persisted', () => {
     const state = comparePm2Persistence(NAME, live(), dumpOf({ name: NAME, ...pm2Env() }));
-    expect(state).toEqual({ persisted: true, reason: null, differences: [] });
+    expect(state).toEqual({ persisted: true, kind: 'ok', reason: null, differences: [] });
+  });
+
+  test('each disagreement is classified by its consequence', () => {
+    expect(comparePm2Persistence(NAME, live(), dumpOf({ name: 'omni-api' })).kind).toBe('unsaved');
+    expect(comparePm2Persistence(NAME, null, dumpOf({ name: NAME, ...pm2Env() })).kind).toBe('stale');
+    expect(comparePm2Persistence(NAME, live(), dumpOf({ name: NAME, ...pm2Env({ max_restarts: 1 }) })).kind).toBe('drift');
+    expect(describePm2Persistence(comparePm2Persistence(NAME, live(), NO_DUMP))).toContain('will not survive');
+    expect(describePm2Persistence(comparePm2Persistence(NAME, null, dumpOf({ name: NAME, ...pm2Env() })))).toContain('will start it again');
   });
 
   test('a saved entry on another port is reported by field', () => {
@@ -141,6 +150,23 @@ describe('dump on disk', () => {
     const result = persistPm2Registrations([NAME], { env, getProcess, save: () => ({ ok: true, reason: null }) });
     expect(result.ok).toBe(false);
     expect(result.reasons[0]).toContain('no dump.pm2 exists');
+  });
+
+  test('force is passed through to pm2 save', () => {
+    const calls = [];
+    const getProcess = () => null;
+    fs.writeFileSync(path.join(pm2Home, 'dump.pm2'), JSON.stringify([{ name: NAME }]));
+    persistPm2Registrations([NAME], {
+      env,
+      getProcess,
+      force: true,
+      save: (options) => {
+        calls.push(options);
+        fs.writeFileSync(path.join(pm2Home, 'dump.pm2'), '[]');
+        return { ok: true, reason: null };
+      },
+    });
+    expect(calls).toEqual([{ force: true }]);
   });
 
   test('a failing pm2 save is reported with its reason', () => {

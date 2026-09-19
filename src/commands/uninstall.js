@@ -284,13 +284,15 @@ export async function runUninstall(opts = {}) {
 
   // `pm2 delete` is live-only too. If dump.pm2 still lists an entry we just
   // removed, the next `pm2 resurrect` would bring the postmaster back.
+  // `force`: when autopg was the only pm2 process, plain `pm2 save` skips
+  // writing an empty list and the stale entry would stay saved.
   if (pm2Available) {
-    const persisted = persistPm2Registrations(TIER_A_PM2_PROCESSES);
+    const persisted = persistPm2Registrations(TIER_A_PM2_PROCESSES, { force: true });
     if (!persisted.ok) {
       emit(
         'err',
         `WARNING: could not update pm2's saved process list (${persisted.reasons.join('; ')}); `
-        + 'run `pm2 save` or the removed entries come back at the next `pm2 resurrect`.',
+        + 'run `pm2 save --force` or the removed entries come back at the next `pm2 resurrect`.',
         silent,
       );
     }

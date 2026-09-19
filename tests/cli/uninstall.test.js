@@ -97,6 +97,8 @@ if (args[0] === 'save') {
   const names = fs.readdirSync(dir)
     .filter((f) => f.startsWith('registered-'))
     .map((f) => ({ name: f.slice('registered-'.length) }));
+  // Like pm2: with nothing registered, plain save skips writing; --force writes.
+  if (names.length === 0 && !args.includes('--force')) process.exit(0);
   fs.mkdirSync(process.env.PM2_HOME, { recursive: true });
   fs.writeFileSync(path.join(process.env.PM2_HOME, 'dump.pm2'), JSON.stringify(names));
   process.exit(0);
@@ -418,8 +420,21 @@ describe('autopg uninstall — confirmation gate', () => {
 
     const result = runCli(['uninstall', '--yes']);
     expect(result.status).toBe(0);
-    expect(readCallLog(stubBin.calls).some((c) => c[0] === 'save')).toBe(true);
+    expect(readCallLog(stubBin.calls)).toContainEqual(['save', '--force']);
     expect(JSON.parse(fs.readFileSync(dumpPath, 'utf8')).map((e) => e.name)).not.toContain('autopg-server');
+  });
+
+  test('--yes empties the saved dump when autopg was the only pm2 process (plain save would skip)', () => {
+    seedAdminJson(SUPERVISOR);
+    fs.writeFileSync(path.join(stubBin.dir, 'registered-autopg-server'), '');
+    fs.mkdirSync(path.join(tmpHome, 'pm2'), { recursive: true });
+    const dumpPath = path.join(tmpHome, 'pm2', 'dump.pm2');
+    fs.writeFileSync(dumpPath, JSON.stringify([{ name: 'autopg-server' }]));
+
+    const result = runCli(['uninstall', '--yes']);
+    expect(result.status).toBe(0);
+    expect(result.stderr).not.toContain('WARNING');
+    expect(JSON.parse(fs.readFileSync(dumpPath, 'utf8'))).toEqual([]);
   });
 
   test('--yes runs the existing teardown path', () => {

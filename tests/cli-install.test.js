@@ -103,6 +103,8 @@ if (args[0] === 'start') {
 if (args[0] === 'save') {
   if (process.env.AUTOPG_TEST_PM2_SAVE_FAIL === '1') process.exit(1);
   const registered = fs.existsSync(${JSON.stringify(path.join(dir, 'registered'))});
+  // Like pm2: with nothing registered, plain save skips writing; --force writes.
+  if (!registered && !args.includes('--force')) process.exit(0);
   const state = fs.existsSync(serviceStatePath) ? JSON.parse(fs.readFileSync(serviceStatePath, 'utf8')) : {};
   fs.mkdirSync(process.env.PM2_HOME, { recursive: true });
   fs.writeFileSync(
