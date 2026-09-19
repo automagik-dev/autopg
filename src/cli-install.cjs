@@ -33,6 +33,11 @@ const {
   formatServiceState,
   waitForServiceReadiness,
 } = require('./lib/service-state.cjs');
+const {
+  describePm2Persistence,
+  inspectPm2Persistence,
+  persistPm2Registrations,
+} = require('./lib/pm2-persistence.cjs');
 
 // pgserve v2.6.1 — `pgserve install --help` should print usage + exit 0,
 // not run the install (B2 HIGH from QA-RECIPE-B2.md). Single source of
@@ -52,6 +57,8 @@ Options:
   --ui-host <host>      Bind host for the UI (default: 127.0.0.1)
   --no-ui               Skip the autopg-ui pm2 process (headless / CI)
   --no-pm2              Skip pm2 registration entirely (Tier B / external supervisor)
+  --no-save             Do not run \`pm2 save\`; the registration stays live-only and
+                        is lost at the next \`pm2 resurrect\` until you save it yourself
   --help, -h            Show this help and exit
 
 Idempotent: re-running with the same args is a no-op when the existing
@@ -862,6 +869,39 @@ function cmdAuthDispatch(args) {
  * `scriptPath` is the path to `bin/postgres-server.js` resolved by the
  * wrapper before this module is required (avoids re-resolving here).
  */
+/**
+ * Make the pm2 registrations durable (issue #144). `pm2 start` only registers
+ * with the running daemon; after a daemon restart pm2 restores what
+ * `dump.pm2` held at the last `pm2 save`, so an unsaved autopg-server silently
+ * disappears while its consumers come back and crash-loop.
+ *
+ * Saves only when the live entries differ from the dump, so an unchanged
+ * re-install leaves the operator's dump alone.
+ */
+function persistPm2Install({ noSave }) {
+  const names = [PM2_PROCESS_NAME, UI_PM2_PROCESS_NAME];
+  if (noSave) {
+    const unsaved = names
+      .map((name) => inspectPm2Persistence(name))
+      .filter((state) => !state.persisted);
+    for (const state of unsaved) {
+      note(`WARNING: --no-save: ${describePm2Persistence(state)}; fix it with \`pm2 save\``);
+    }
+    return;
+  }
+  const result = persistPm2Registrations(names);
+  if (!result.ok) {
+    fail(
+      `the service is running, but its pm2 registration could not be made durable: ${result.reasons.join('; ')}. `
+      + 'It will be lost at the next `pm2 resurrect`. Fix pm2 and re-run `autopg install`, '
+      + 'or pass `--no-save` to manage `pm2 save` yourself.',
+    );
+  }
+  if (result.saved) {
+    ok('saved the pm2 process list (`pm2 save`) so the registration survives `pm2 resurrect`');
+  }
+}
+
 async function cmdInstall(args, ctx) {
   // B2 (v2.6.1): `--help` / `-h` MUST short-circuit before any side
   // effects (no pm2 spawn, no admin.json write, no data-dir create).
@@ -910,6 +950,7 @@ async function cmdInstall(args, ctx) {
 
   const noUi = args.includes('--no-ui');
   const withUi = args.includes('--with-ui');
+  const noSave = args.includes('--no-save');
   const redeploy = args.includes('--redeploy');
   const existingBeforeInstall = pm2GetProcess(PM2_PROCESS_NAME);
   // Port the registered postmaster really runs on. pm2 replays the args it
@@ -994,6 +1035,7 @@ async function cmdInstall(args, ctx) {
   // post-install without restarting postgres.
   if (withUi) {
     cmdInstallUi(ctx, { uiPort, uiHost, refresh: true });
+    persistPm2Install({ noSave });
     return 0;
   }
 
@@ -1050,6 +1092,7 @@ async function cmdInstall(args, ctx) {
     }
     ok(`already installed and ready (pm2 process "${PM2_PROCESS_NAME}")`);
     if (!noUi) cmdInstallUi(ctx, { uiPort, uiHost });
+    persistPm2Install({ noSave });
     return 0;
   }
 
@@ -1092,6 +1135,7 @@ async function cmdInstall(args, ctx) {
     }
     cmdInstallUi(ctx, { uiPort, uiHost, refresh: redeploy });
   }
+  persistPm2Install({ noSave });
   return 0;
 }
 
@@ -1172,6 +1216,11 @@ function cmdStatus(args) {
     status: serviceState.status,
     ready: serviceState.ready,
     supervisorStatus,
+    // false = live under pm2 but not in dump.pm2, so it is gone after the
+    // next `pm2 resurrect`. null when pm2 is not the supervisor.
+    persisted: supervisor === 'pm2'
+      ? inspectPm2Persistence(PM2_PROCESS_NAME, { getProcess: () => proc }).persisted
+      : null,
     pid,
     port,
     socketDir,
@@ -1202,6 +1251,9 @@ function cmdStatus(args) {
   process.stdout.write(`status      ${payload.status}${payload.pid ? ` (pid ${payload.pid})` : ''}\n`);
   if (payload.supervisor) {
     process.stdout.write(`supervisor  ${payload.supervisor} (${payload.supervisorStatus})\n`);
+    if (payload.persisted === false) {
+      process.stdout.write('persisted   no — run `pm2 save`, or it is lost at the next `pm2 resurrect`\n');
+    }
   }
   if (payload.port != null) process.stdout.write(`port        ${payload.port}\n`);
   if (payload.url) process.stdout.write(`url         ${payload.url}\n`);

@@ -93,6 +93,17 @@ if (args[0] === 'start') {
   process.exit(0);
 }
 
+if (args[0] === 'save') {
+  const names = fs.readdirSync(dir)
+    .filter((f) => f.startsWith('registered-'))
+    .map((f) => ({ name: f.slice('registered-'.length) }));
+  // Like pm2: with nothing registered, plain save skips writing; --force writes.
+  if (names.length === 0 && !args.includes('--force')) process.exit(0);
+  fs.mkdirSync(process.env.PM2_HOME, { recursive: true });
+  fs.writeFileSync(path.join(process.env.PM2_HOME, 'dump.pm2'), JSON.stringify(names));
+  process.exit(0);
+}
+
 if (args[0] === 'delete') {
   const name = args[1];
   const s = sentinelOf(name);
@@ -127,6 +138,8 @@ function runCli(args, env = {}) {
       // Keep the socket dir (and the stub's runtime.json) inside the test's
       // tempdir instead of the host's canonical /tmp/pgserve.
       XDG_RUNTIME_DIR: path.join(tmpHome, 'runtime'),
+      // pm2's saved process list; never the developer's real ~/.pm2.
+      PM2_HOME: path.join(tmpHome, 'pm2'),
       AUTOPG_TEST_LIVE_PID: String(process.pid),
       PATH: `${stubBin.dir}:${process.env.PATH}`,
       // Skip the B3 port-preflight (v2.6.1) so tests that don't pin a
@@ -396,6 +409,32 @@ describe('autopg uninstall — confirmation gate', () => {
     expect(after.filter((c) => c[0] === 'delete')).toEqual([]);
     expect(fs.existsSync(path.join(stubBin.dir, 'registered-autopg-server'))).toBe(true);
     expect(readAdminJsonOnDisk()).toEqual(SUPERVISOR);
+  });
+
+  test('--yes also drops the entries from pm2\'s saved dump so resurrect cannot bring them back', () => {
+    seedAdminJson(SUPERVISOR);
+    fs.writeFileSync(path.join(stubBin.dir, 'registered-autopg-server'), '');
+    fs.mkdirSync(path.join(tmpHome, 'pm2'), { recursive: true });
+    const dumpPath = path.join(tmpHome, 'pm2', 'dump.pm2');
+    fs.writeFileSync(dumpPath, JSON.stringify([{ name: 'omni-api' }, { name: 'autopg-server' }]));
+
+    const result = runCli(['uninstall', '--yes']);
+    expect(result.status).toBe(0);
+    expect(readCallLog(stubBin.calls)).toContainEqual(['save', '--force']);
+    expect(JSON.parse(fs.readFileSync(dumpPath, 'utf8')).map((e) => e.name)).not.toContain('autopg-server');
+  });
+
+  test('--yes empties the saved dump when autopg was the only pm2 process (plain save would skip)', () => {
+    seedAdminJson(SUPERVISOR);
+    fs.writeFileSync(path.join(stubBin.dir, 'registered-autopg-server'), '');
+    fs.mkdirSync(path.join(tmpHome, 'pm2'), { recursive: true });
+    const dumpPath = path.join(tmpHome, 'pm2', 'dump.pm2');
+    fs.writeFileSync(dumpPath, JSON.stringify([{ name: 'autopg-server' }]));
+
+    const result = runCli(['uninstall', '--yes']);
+    expect(result.status).toBe(0);
+    expect(result.stderr).not.toContain('WARNING');
+    expect(JSON.parse(fs.readFileSync(dumpPath, 'utf8'))).toEqual([]);
   });
 
   test('--yes runs the existing teardown path', () => {
