@@ -94,10 +94,10 @@ Per-platform pipeline (see `.github/workflows/`):
 
 ```
 release.yml (bump job) tags v<version>, or: git push origin v<version>
-   └── build-tarballs.yml @ tag     → assembles autopg-<v>-<plat>.tar.gz + .sha256
-         uploads as artifact: autopg-<v>-<plat>
-         │
-         └── kick-sign-attest dispatches sign-attest.yml @ tag
+   ├── build-tarballs.yml @ tag     → assembles autopg-<v>-<plat>.tar.gz + .sha256
+   │     uploads as artifact: autopg-<v>-<plat>
+   │
+   └── kick-sign-attest dispatches sign-attest.yml @ tag
          ├── cosign sign-blob (keyless) → .sig + .cert
          ├── attest-build-provenance (SLSA L3) → .intoto.jsonl
          ├── cosign verify-blob (self-check) — gate-fails the run if the cert
