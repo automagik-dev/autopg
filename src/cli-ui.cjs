@@ -295,9 +295,13 @@ function deepMergePlain(base, patch) {
   return out;
 }
 
-function handlePostRestart(req, res, ctx) {
+// `cli-restart.dispatch` is async: it resolves only after the postmaster is
+// ready (or the readiness wait times out), so the response must wait for it.
+// `ctx.restartDispatch` is a test hook, mirroring `ctx.statusOverride`.
+async function handlePostRestart(req, res, ctx = {}) {
   try {
-    const code = cliRestart.dispatch([], { scriptPath: ctx.scriptPath });
+    const restartDispatch = ctx.restartDispatch || cliRestart.dispatch;
+    const code = await restartDispatch([], { scriptPath: ctx.scriptPath });
     if (code === 0) {
       sendJson(res, 200, { ok: true });
     } else {

@@ -13,7 +13,7 @@
  * - No locale dependency (works on any system)
  */
 
-/* global fetch, Bun */
+/* global fetch, Bun, AbortSignal */
 import { EventEmitter } from 'events';
 import os from 'os';
 import path from 'path';
@@ -21,6 +21,17 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { loadEffectiveConfig } from './settings-loader.cjs';
 import { buildPostgresArgs } from './settings-pg-args.cjs';
+import {
+  PGVECTOR_POOL_URL,
+  parsePgvectorDebFilename,
+  pgvectorDebUrl,
+  resolvePgvectorDebVersions,
+} from './pgvector-version.js';
+import { createBoundedTail, drainStream } from './lib/drain-stream.js';
+
+// How much of postgres's stdout/stderr is kept for startup-failure and crash
+// diagnostics. Both only need the end of the output.
+const STARTUP_OUTPUT_TAIL_CHARS = 64 * 1024;
 
 /**
  * Get platform key for binary lookup (e.g., 'windows-x64', 'linux-x64', 'darwin-arm64')
@@ -972,7 +983,10 @@ export class PostgresManager extends EventEmitter {
       });
 
       let started = false;
-      let startupOutput = '';
+      // Diagnostics only ever need the end of postgres's output. Bounded: with
+      // log_statement=all this stream carries every query for the life of the
+      // server, and an unbounded buffer grew until allocation failed (#149).
+      const startupOutput = createBoundedTail(STARTUP_OUTPUT_TAIL_CHARS);
       let processExited = false;
       let portBindingSeen = false;
       const portStr = this.port.toString();
@@ -993,37 +1007,41 @@ export class PostgresManager extends EventEmitter {
       };
 
       // Read stderr - detect port binding in logs (locale-independent: just look for port number)
-      const readStream = async (stream) => {
-        const reader = stream.getReader();
-        const decoder = new TextDecoder();
-        try {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            const message = decoder.decode(value);
-            startupOutput += message;
-            this.logger.debug({ pgOutput: message.trim() }, 'PostgreSQL output');
+      //
+      // These pipes must be drained for as long as postgres lives: if the
+      // read loop stops, the pipe fills and every backend blocks on its next
+      // log write — the whole database hangs with both processes still alive
+      // (#149). drainStream keeps reading whatever the handler below throws.
+      const readStream = (stream, name) => drainStream(stream, {
+        onChunk: (message) => {
+          startupOutput.append(message);
+          this.logger.debug({ pgOutput: message.trim() }, 'PostgreSQL output');
 
-            // Detect port binding - look for our port number in log output
-            // This is locale-independent (numbers are universal)
-            if (!portBindingSeen && message.includes(portStr)) {
-              portBindingSeen = true;
-              // Give PostgreSQL 500ms after port binding to finish startup
-              setTimeout(() => {
-                if (!started && !processExited) {
-                  markReady('log-port-binding');
-                }
-              }, 500);
-            }
+          // Detect port binding - look for our port number in log output
+          // This is locale-independent (numbers are universal)
+          if (!portBindingSeen && message.includes(portStr)) {
+            portBindingSeen = true;
+            // Give PostgreSQL 500ms after port binding to finish startup
+            setTimeout(() => {
+              if (!started && !processExited) {
+                markReady('log-port-binding');
+              }
+            }, 500);
           }
-        } catch {
-          // Stream closed
-        }
-      };
+        },
+        onError: (error, phase) => {
+          const detail = { stream: name, phase, err: error?.message ?? String(error) };
+          if (phase === 'read' && !processExited) {
+            this.logger?.error(detail, 'PostgreSQL output stream broke while postgres is running — it is no longer drained and postgres may block on its next log write');
+          } else if (phase === 'chunk') {
+            this.logger?.error(detail, 'Failed to handle PostgreSQL output; still draining');
+          }
+        },
+      });
 
       // Start reading both streams
-      readStream(this.process.stderr);
-      readStream(this.process.stdout);
+      readStream(this.process.stderr, 'stderr');
+      readStream(this.process.stdout, 'stdout');
 
       // Handle process exit
       //
@@ -1040,7 +1058,7 @@ export class PostgresManager extends EventEmitter {
         processExited = true;
         const expected = !!this._stopping;
         if (!started) {
-          reject(new Error(`PostgreSQL exited with code ${code} before starting: ${startupOutput}`));
+          reject(new Error(`PostgreSQL exited with code ${code} before starting: ${startupOutput.toString()}`));
         }
         this.process = null;
         // On unexpected exit (not via stop()), reset cached paths so that
@@ -1061,9 +1079,7 @@ export class PostgresManager extends EventEmitter {
           // output captured' so the field stays present in structured
           // logs).
           const STDERR_TAIL_BUDGET = 4096;
-          const tail = startupOutput.length > STDERR_TAIL_BUDGET
-            ? startupOutput.slice(-STDERR_TAIL_BUDGET)
-            : startupOutput;
+          const tail = startupOutput.toString().slice(-STDERR_TAIL_BUDGET);
           this.logger?.warn(
             { code, postgresStderrTail: tail.trim() || 'no postgres output captured' },
             'PostgreSQL subprocess exited unexpectedly — socketDir/databaseDir reset'
@@ -1163,7 +1179,7 @@ export class PostgresManager extends EventEmitter {
           const hint = isWindows
             ? '\n\nOn Windows, this may be caused by Windows Firewall blocking localhost connections.\nTry: netsh advfirewall firewall add rule name="pgserve" dir=in action=allow protocol=TCP localport=' + this.port
             : '';
-          reject(new Error(`PostgreSQL startup timed out after 30s.${hint}\n\nOutput: ${startupOutput}`));
+          reject(new Error(`PostgreSQL startup timed out after 30s.${hint}\n\nOutput: ${startupOutput.toString()}`));
         }
       }, 30000);
     });
@@ -1313,7 +1329,13 @@ export class PostgresManager extends EventEmitter {
     try {
       await this._installPgvectorFromDeb({ pgMajor, ...paths });
     } catch (error) {
-      this.logger.warn({ err: error.message }, 'Failed to install pgvector extension files (non-fatal)');
+      // Non-fatal for the postmaster, but never quiet: the message names the
+      // versions tried and the AUTOPG_PGVECTOR_DEB / AUTOPG_PGVECTOR_VERSION
+      // escape hatches (issue #145).
+      this.logger.warn(
+        { err: error.message, pgMajor },
+        'Failed to install pgvector extension files (non-fatal) — CREATE EXTENSION vector will fail until fixed',
+      );
     }
   }
 
@@ -1421,16 +1443,12 @@ export class PostgresManager extends EventEmitter {
       return;
     }
 
-    // Download prebuilt pgvector .deb from apt.postgresql.org (HTTPS)
-    // Version 0.8.1-2 — update when new releases ship
-    const pgvectorVersion = '0.8.1-2';
-    const debUrl = `https://apt.postgresql.org/pub/repos/apt/pool/main/p/pgvector/postgresql-${pgMajor}-pgvector_${pgvectorVersion}.pgdg%2B1_${arch}.deb`;
-    this.logger.info({ url: debUrl, pgMajor }, 'Downloading pgvector...');
-
-    const res = await fetch(debUrl);
-    if (!res.ok) throw new Error(`Download failed: ${res.status}`);
-
-    const buffer = Buffer.from(await res.arrayBuffer());
+    // Obtain the .deb: a local file (AUTOPG_PGVECTOR_DEB, no network) or a
+    // download from the pgdg pool. pgdg garbage-collects superseded
+    // packages, so the version is resolved from the pool listing instead of
+    // being pinned (issue #145); `resolvePgvectorDebVersions` documents the
+    // pin / pool / fallback precedence.
+    const { buffer, pgvectorVersion, sourceUrl } = await this._obtainPgvectorDeb({ pgMajor, arch });
 
     // Extract .deb (it's an ar archive containing data.tar.xz)
     const tmpDir = path.join(os.tmpdir(), `pgserve-pgvector-${process.pid}-${Date.now()}`);
@@ -1484,16 +1502,71 @@ export class PostgresManager extends EventEmitter {
       this._writePgvectorMeta(vectorMeta, {
         pgMajor,
         pgvectorVersion,
-        sourceUrl: debUrl,
+        sourceUrl,
         postgresPath: this.binaries.postgres,
         installedAt: new Date().toISOString(),
       });
 
-      this.logger.info({ pgMajor, pgvectorVersion }, 'pgvector extension installed successfully');
+      this.logger.info({ pgMajor, pgvectorVersion, sourceUrl }, 'pgvector extension installed successfully');
     } finally {
       // Always clean up tmpdir, even on failure
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  }
+
+  /**
+   * Return the pgvector .deb bytes plus the version/source to record in
+   * `vector.meta.json`.
+   *
+   * - `AUTOPG_PGVECTOR_DEB=<file>`: read the local file, skip the network.
+   * - Otherwise resolve candidate versions (pin → pool listing → fallback
+   *   list) and download the first one that exists. Every miss is logged;
+   *   when all candidates fail the error names each attempt and the
+   *   `AUTOPG_PGVECTOR_DEB` / `AUTOPG_PGVECTOR_VERSION` escape hatches so
+   *   the non-fatal warning upstream is actionable.
+   */
+  async _obtainPgvectorDeb({ pgMajor, arch }) {
+    const localDeb = (process.env.AUTOPG_PGVECTOR_DEB || '').trim();
+    if (localDeb) {
+      if (!fs.existsSync(localDeb)) {
+        throw new Error(`AUTOPG_PGVECTOR_DEB points at a missing file: ${localDeb}`);
+      }
+      const pgvectorVersion = parsePgvectorDebFilename(localDeb) || 'local';
+      this.logger.info({ file: localDeb, pgMajor, pgvectorVersion }, 'Installing pgvector from local .deb (AUTOPG_PGVECTOR_DEB)');
+      return { buffer: fs.readFileSync(localDeb), pgvectorVersion, sourceUrl: `file://${path.resolve(localDeb)}` };
+    }
+
+    const resolved = await resolvePgvectorDebVersions({ pgMajor, arch });
+    if (resolved.source === 'fallback') {
+      this.logger.warn(
+        { err: resolved.error, versions: resolved.versions },
+        'pgvector pool listing unavailable — trying known versions in order',
+      );
+    } else {
+      this.logger.debug({ source: resolved.source, versions: resolved.versions }, 'Resolved pgvector .deb candidates');
+    }
+
+    const attempts = [];
+    for (const version of resolved.versions) {
+      const url = pgvectorDebUrl({ pgMajor, arch, version });
+      this.logger.info({ url, pgMajor, pgvectorVersion: version }, 'Downloading pgvector...');
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+        if (!res.ok) {
+          attempts.push(`${version} (HTTP ${res.status})`);
+          continue;
+        }
+        return { buffer: Buffer.from(await res.arrayBuffer()), pgvectorVersion: version, sourceUrl: url };
+      } catch (err) {
+        attempts.push(`${version} (${err && err.message ? err.message : String(err)})`);
+      }
+    }
+
+    throw new Error(
+      `pgvector .deb download failed for PostgreSQL ${pgMajor}/${arch} — tried ${attempts.join(', ')}. `
+      + `Workaround: download postgresql-${pgMajor}-pgvector_<ver>.pgdg+1_${arch}.deb from ${PGVECTOR_POOL_URL} `
+      + 'and restart with AUTOPG_PGVECTOR_DEB=<file>, or pin a known version with AUTOPG_PGVECTOR_VERSION=<ver>.',
+    );
   }
 
   /**
