@@ -228,6 +228,29 @@ describe('pgserve install', () => {
     expect(calls).toContainEqual(['start', 'autopg-server']);
   });
 
+  test('re-install with a different --port fails fast and leaves config untouched', () => {
+    expect(runCli(['install', '--no-ui', '--port', '8490']).status).toBe(0);
+    const configPath = path.join(tmpHome, 'config.json');
+    const adminPath = path.join(tmpHome, 'admin.json');
+    const configBefore = fs.readFileSync(configPath, 'utf8');
+    const adminBefore = fs.readFileSync(adminPath, 'utf8');
+
+    const result = runCli(['install', '--no-ui', '--port', '8491']);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('already installed on port 8490');
+    expect(result.stderr).toContain('--redeploy');
+
+    expect(fs.readFileSync(configPath, 'utf8')).toBe(configBefore);
+    expect(fs.readFileSync(adminPath, 'utf8')).toBe(adminBefore);
+  });
+
+  test('re-install repeating the registered --port stays idempotent', () => {
+    expect(runCli(['install', '--no-ui', '--port', '8490']).status).toBe(0);
+    const result = runCli(['install', '--no-ui', '--port', '8490']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('already installed and ready');
+  });
+
   test('autopg install registers BOTH autopg-server and autopg-ui by default', () => {
     runCli(['install']);
     const calls = readCallLog(stubBin.calls);
@@ -770,7 +793,21 @@ describe('pgserve singleton (v2.4) — socket dir + admin.json supervisor record
     expect(result.stderr).toContain('autopg service uninstall');
   });
 
-  test('install fallback uses /tmp/pgserve when XDG_RUNTIME_DIR is unset', () => {
+  // This is the one test that has to use the host's canonical socket dir, and
+  // the pm2 stub publishes runtime.json there. When a real AutoPG already owns
+  // that record (a dev machine without XDG_RUNTIME_DIR), overwriting it would
+  // misdirect live consumers — and a killed test run would never restore it.
+  function hostRuntimeIsLive() {
+    try {
+      const { autopgPid } = JSON.parse(fs.readFileSync('/tmp/pgserve/runtime.json', 'utf8'));
+      process.kill(autopgPid, 0);
+      return true;
+    } catch (err) {
+      return err?.code === 'EPERM';
+    }
+  }
+
+  test.skipIf(hostRuntimeIsLive())('install fallback uses /tmp/pgserve when XDG_RUNTIME_DIR is unset', () => {
     // Clear XDG so resolveSocketDir falls back. The canonical /tmp/pgserve
     // path may already exist on the host — that's fine: ensureSocketDir
     // is idempotent and re-chmods to 0700.
