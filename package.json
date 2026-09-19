@@ -1,6 +1,6 @@
 {
   "name": "autopg",
-  "version": "3.0.7",
+  "version": "3.1.0",
   "description": "Embedded PostgreSQL server with true concurrent connections - zero config, auto-provision databases",
   "main": "src/index.js",
   "type": "module",

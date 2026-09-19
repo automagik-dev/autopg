@@ -27,6 +27,17 @@ const fs = require('node:fs');
 const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
+const {
+  PM2_PROCESS_NAME,
+  evaluateServiceState,
+  formatServiceState,
+  waitForServiceReadiness,
+} = require('./lib/service-state.cjs');
+const {
+  describePm2Persistence,
+  inspectPm2Persistence,
+  persistPm2Registrations,
+} = require('./lib/pm2-persistence.cjs');
 
 // pgserve v2.6.1 — `pgserve install --help` should print usage + exit 0,
 // not run the install (B2 HIGH from QA-RECIPE-B2.md). Single source of
@@ -46,6 +57,8 @@ Options:
   --ui-host <host>      Bind host for the UI (default: 127.0.0.1)
   --no-ui               Skip the autopg-ui pm2 process (headless / CI)
   --no-pm2              Skip pm2 registration entirely (Tier B / external supervisor)
+  --no-save             Do not run \`pm2 save\`; the registration stays live-only and
+                        is lost at the next \`pm2 resurrect\` until you save it yourself
   --help, -h            Show this help and exit
 
 Idempotent: re-running with the same args is a no-op when the existing
@@ -196,7 +209,6 @@ function getCurrentVersion() {
 //
 // Default postgres port moves from 8432 (the old bun-proxy listener) to 5432
 // (the postgres standard, since the postmaster now binds TCP directly).
-const PM2_PROCESS_NAME = 'autopg-server';
 // Legacy entry name (pre-v2.4). Self-healing migration in Group 6 will
 // `pm2 delete pgserve` after registering `autopg-server`; we surface the
 // constant here so cleanup tooling and tests can reference it without
@@ -460,6 +472,19 @@ function pm2GetProcess(name) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Port the registered pm2 entry launches the postmaster on — the `--port`
+ * arg from `buildPm2StartArgs`, which pm2 keeps and replays on every
+ * `pm2 start <name>` / `pm2 restart <name>`. Null when pm2 doesn't expose it.
+ */
+function pm2RegisteredPort(proc) {
+  const procArgs = proc?.pm2_env?.args;
+  if (!Array.isArray(procArgs)) return null;
+  const i = procArgs.lastIndexOf('--port');
+  const value = i >= 0 ? Number.parseInt(procArgs[i + 1], 10) : Number.NaN;
+  return Number.isInteger(value) ? value : null;
 }
 
 function pm2IsAvailable() {
@@ -844,6 +869,39 @@ function cmdAuthDispatch(args) {
  * `scriptPath` is the path to `bin/postgres-server.js` resolved by the
  * wrapper before this module is required (avoids re-resolving here).
  */
+/**
+ * Make the pm2 registrations durable (issue #144). `pm2 start` only registers
+ * with the running daemon; after a daemon restart pm2 restores what
+ * `dump.pm2` held at the last `pm2 save`, so an unsaved autopg-server silently
+ * disappears while its consumers come back and crash-loop.
+ *
+ * Saves only when the live entries differ from the dump, so an unchanged
+ * re-install leaves the operator's dump alone.
+ */
+function persistPm2Install({ noSave }) {
+  const names = [PM2_PROCESS_NAME, UI_PM2_PROCESS_NAME];
+  if (noSave) {
+    const unsaved = names
+      .map((name) => inspectPm2Persistence(name))
+      .filter((state) => !state.persisted);
+    for (const state of unsaved) {
+      note(`WARNING: --no-save: ${describePm2Persistence(state)}; fix it with \`pm2 save\``);
+    }
+    return;
+  }
+  const result = persistPm2Registrations(names);
+  if (!result.ok) {
+    fail(
+      `the service is running, but its pm2 registration could not be made durable: ${result.reasons.join('; ')}. `
+      + 'It will be lost at the next `pm2 resurrect`. Fix pm2 and re-run `autopg install`, '
+      + 'or pass `--no-save` to manage `pm2 save` yourself.',
+    );
+  }
+  if (result.saved) {
+    ok('saved the pm2 process list (`pm2 save`) so the registration survives `pm2 resurrect`');
+  }
+}
+
 async function cmdInstall(args, ctx) {
   // B2 (v2.6.1): `--help` / `-h` MUST short-circuit before any side
   // effects (no pm2 spawn, no admin.json write, no data-dir create).
@@ -890,7 +948,33 @@ async function cmdInstall(args, ctx) {
     fail('pm2 not found in PATH. Install with: bun add -g pm2  (or npm i -g pm2). Pass --no-pm2 for CI / Tier B-bound hosts.');
   }
 
-  const port = parsePort(args) ?? readConfig()?.port ?? DEFAULT_PORT;
+  const noUi = args.includes('--no-ui');
+  const withUi = args.includes('--with-ui');
+  const noSave = args.includes('--no-save');
+  const redeploy = args.includes('--redeploy');
+  const existingBeforeInstall = pm2GetProcess(PM2_PROCESS_NAME);
+  // Port the registered postmaster really runs on. pm2 replays the args it
+  // was started with, so those win; admin.json and config.json cover entries
+  // that don't expose them.
+  const registeredPort = existingBeforeInstall
+    ? pm2RegisteredPort(existingBeforeInstall) ?? readAdminJsonSync()?.port ?? readConfig()?.port ?? null
+    : null;
+  const requestedPort = parsePort(args);
+  // Without --redeploy the live process is kept, so a different `--port`
+  // can't take effect. Refuse before anything is written: rewriting
+  // config.json/admin.json to a port the postmaster is not on would fail the
+  // readiness wait below and every later `restart`.
+  if (!redeploy && registeredPort != null && requestedPort != null && requestedPort !== registeredPort) {
+    fail(
+      `pm2 process "${PM2_PROCESS_NAME}" is already installed on port ${registeredPort}; `
+      + `re-run with \`--redeploy\` to move it to port ${requestedPort}`,
+    );
+  }
+  const port = requestedPort ?? registeredPort ?? readConfig()?.port ?? DEFAULT_PORT;
+  // Our own postmaster already holds its port, so the bind test would only
+  // see ourselves. Any other port — including a `--redeploy` to a new one —
+  // still gets tested while the old postmaster is alive to fall back on.
+  const portHeldByUs = existingBeforeInstall && (registeredPort == null || registeredPort === port);
 
   // B3 (v2.6.1): pre-flight bind-test the chosen port BEFORE creating
   // pm2 entries / admin.json / data dir. Without this, an operator on
@@ -898,7 +982,7 @@ async function cmdInstall(args, ctx) {
   // while the postmaster crashes silently — divergence between
   // supervisor state and data-plane state. Fail fast with a clear hint.
   try {
-    await assertPortAvailable(port);
+    if (!withUi && !portHeldByUs) await assertPortAvailable(port);
   } catch (err) {
     if (err.code === 'EADDRINUSE') {
       process.stderr.write(`${err.message}\n`);
@@ -938,9 +1022,6 @@ async function cmdInstall(args, ctx) {
     fail(err.message);
   }
 
-  const noUi = args.includes('--no-ui');
-  const withUi = args.includes('--with-ui');
-  const redeploy = args.includes('--redeploy');
   const uiPort = parseUiPort(args) ?? DEFAULT_UI_PORT;
   const uiHost = parseUiHost(args) ?? DEFAULT_UI_HOST;
 
@@ -954,6 +1035,7 @@ async function cmdInstall(args, ctx) {
   // post-install without restarting postgres.
   if (withUi) {
     cmdInstallUi(ctx, { uiPort, uiHost, refresh: true });
+    persistPm2Install({ noSave });
     return 0;
   }
 
@@ -990,13 +1072,27 @@ async function cmdInstall(args, ctx) {
   // even on hosts where the daemon was registered pre-v2.2.3.
   const existing = redeploy ? null : pm2GetProcess(PM2_PROCESS_NAME);
   if (existing) {
-    ok(`already installed (pm2 process "${PM2_PROCESS_NAME}", status=${existing.pm2_env?.status ?? 'unknown'})`);
+    if (existing.pm2_env?.status !== 'online') {
+      const startResult = spawnSync('pm2', ['start', PM2_PROCESS_NAME], { stdio: 'inherit' });
+      if (startResult.status !== 0) {
+        fail(`pm2 start failed (exit ${startResult.status}). Logs: ${getLogsDir()}/${PM2_PROCESS_NAME}-error.log`);
+      }
+    }
     // Refresh config in case install was re-run with new flags — but
     // don't tear down the live process. Operators wanting a port change
     // should `uninstall` then `install` (or pass --redeploy).
     writeConfig({ port, dataDir, registeredAt: readConfig()?.registeredAt ?? new Date().toISOString() });
     writeSupervisorRecord(adminJson, { supervisor: 'pm2', socketDir, port });
+    const state = await waitForServiceReadiness();
+    if (!state.ready) {
+      fail(
+        `pm2 process "${PM2_PROCESS_NAME}" did not become ready: ${formatServiceState(state)}. `
+        + `Logs: ${getLogsDir()}/${PM2_PROCESS_NAME}-error.log`,
+      );
+    }
+    ok(`already installed and ready (pm2 process "${PM2_PROCESS_NAME}")`);
     if (!noUi) cmdInstallUi(ctx, { uiPort, uiHost });
+    persistPm2Install({ noSave });
     return 0;
   }
 
@@ -1011,7 +1107,14 @@ async function cmdInstall(args, ctx) {
 
   writeConfig({ port, dataDir, registeredAt: new Date().toISOString() });
   writeSupervisorRecord(adminJson, { supervisor: 'pm2', socketDir, port });
-  ok(`installed: pm2 process "${PM2_PROCESS_NAME}" on port ${port} (socket: ${socketDir}, data: ${dataDir})`);
+  const state = await waitForServiceReadiness();
+  if (!state.ready) {
+    fail(
+      `pm2 process "${PM2_PROCESS_NAME}" did not become ready: ${formatServiceState(state)}. `
+      + `Logs: ${getLogsDir()}/${PM2_PROCESS_NAME}-error.log`,
+    );
+  }
+  ok(`installed and ready: pm2 process "${PM2_PROCESS_NAME}" on port ${port} (socket: ${socketDir}, data: ${dataDir})`);
   ok(`url: postgres://localhost:${port}/postgres`);
 
   if (noUi) {
@@ -1032,6 +1135,7 @@ async function cmdInstall(args, ctx) {
     }
     cmdInstallUi(ctx, { uiPort, uiHost, refresh: redeploy });
   }
+  persistPm2Install({ noSave });
   return 0;
 }
 
@@ -1086,7 +1190,10 @@ function cmdStatus(args) {
   }
 
   const proc = pm2GetProcess(PM2_PROCESS_NAME);
-  const status = proc?.pm2_env?.status ?? 'stopped';
+  const supervisor = admin?.supervisor ?? (proc ? 'pm2' : null);
+  const supervisorStatus = supervisor === 'pm2'
+    ? proc?.pm2_env?.status ?? 'missing'
+    : supervisor;
   const pid = proc?.pid ?? null;
   const uptimeMs = proc?.pm2_env?.pm_uptime ? Date.now() - proc.pm2_env.pm_uptime : null;
   const restarts = proc?.pm2_env?.restart_time ?? 0;
@@ -1094,11 +1201,26 @@ function cmdStatus(args) {
   const port = discovery.port;
   const socketDir = discovery.socketDir;
   const dataDir = config?.dataDir ?? null;
+  const serviceState = evaluateServiceState({
+    supervisor,
+    supervisorStatus,
+    supervisorPid: pid,
+    configuredPort: port,
+    runtime,
+    runtimeLive: discovery.liveAutopg,
+  });
 
   const payload = {
     installed: true,
     name: PM2_PROCESS_NAME,
-    status,
+    status: serviceState.status,
+    ready: serviceState.ready,
+    supervisorStatus,
+    // false = live under pm2 but not in dump.pm2, so it is gone after the
+    // next `pm2 resurrect`. null when pm2 is not the supervisor.
+    persisted: supervisor === 'pm2'
+      ? inspectPm2Persistence(PM2_PROCESS_NAME, { getProcess: () => proc }).persisted
+      : null,
     pid,
     port,
     socketDir,
@@ -1108,7 +1230,7 @@ function cmdStatus(args) {
     uptimeMs,
     restarts,
     registeredAt: config?.registeredAt ?? null,
-    supervisor: admin?.supervisor ?? null,
+    supervisor,
     runtime: runtime
       ? {
           socketDir: runtime.socketDir,
@@ -1128,7 +1250,10 @@ function cmdStatus(args) {
   process.stdout.write(`name        ${payload.name}\n`);
   process.stdout.write(`status      ${payload.status}${payload.pid ? ` (pid ${payload.pid})` : ''}\n`);
   if (payload.supervisor) {
-    process.stdout.write(`supervisor  ${payload.supervisor}\n`);
+    process.stdout.write(`supervisor  ${payload.supervisor} (${payload.supervisorStatus})\n`);
+    if (payload.persisted === false) {
+      process.stdout.write('persisted   no — run `pm2 save`, or it is lost at the next `pm2 resurrect`\n');
+    }
   }
   if (payload.port != null) process.stdout.write(`port        ${payload.port}\n`);
   if (payload.url) process.stdout.write(`url         ${payload.url}\n`);
@@ -1269,7 +1394,11 @@ function dispatch(subcommand, args, ctx) {
       // alongside `src/lib/pm2-args.js` instead of inside this legacy
       // dispatcher. dispatch() returns a Promise here; the wrapper
       // already handles both numeric and Promise returns.
-      return import('./commands/uninstall.js').then((mod) => mod.runUninstall());
+      //
+      // `args` MUST be forwarded (issue #146): without it `--help` was
+      // silently dropped and `autopg uninstall --help` tore down the
+      // postmaster instead of printing usage.
+      return import('./commands/uninstall.js').then((mod) => mod.runUninstall({ argv: args }));
     case 'doctor':
       // pgserve-singleton-no-proxy Group 3: read-only V1. Reports the
       // active supervisor + postmaster reachability + admin.json /

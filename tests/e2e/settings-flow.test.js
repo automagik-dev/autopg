@@ -274,20 +274,30 @@ const RUN_DAEMON_E2E = process.env.AUTOPG_E2E_DAEMON === '1';
 
 describe.skipIf(!RUN_DAEMON_E2E)('e2e: full daemon leg (gated)', () => {
   let installPort;
+  // A private pm2 daemon: install now runs `pm2 save`, which would otherwise
+  // snapshot the developer's real ~/.pm2 process list. Short tmpdir path —
+  // pm2's sockets live under PM2_HOME and Unix socket paths are length-limited.
+  let pm2Home;
+  let daemonEnv;
 
   beforeAll(() => {
     installPort = Number(process.env.AUTOPG_E2E_PORT || 8432);
+    pm2Home = fs.mkdtempSync(path.join(os.tmpdir(), 'autopg-e2e-pm2-'));
+    daemonEnv = { ...process.env, AUTOPG_CONFIG_DIR: tmpConfigDir, PM2_HOME: pm2Home };
   });
 
   afterAll(() => {
     try {
-      execFileSync(process.execPath, [WRAPPER, 'uninstall'], {
-        stdio: 'ignore',
-        env: { ...process.env, AUTOPG_CONFIG_DIR: tmpConfigDir },
-      });
+      execFileSync(process.execPath, [WRAPPER, 'uninstall', '--yes'], { stdio: 'ignore', env: daemonEnv });
     } catch {
       // best-effort
     }
+    try {
+      execFileSync('pm2', ['kill'], { stdio: 'ignore', env: daemonEnv });
+    } catch {
+      // best-effort
+    }
+    fs.rmSync(pm2Home, { recursive: true, force: true });
   });
 
   test('install → set shared_buffers → restart → SHOW returns new value', async () => {
@@ -295,14 +305,14 @@ describe.skipIf(!RUN_DAEMON_E2E)('e2e: full daemon leg (gated)', () => {
     // operator's daemon.
     execFileSync(process.execPath, [WRAPPER, 'install', '--port', String(installPort)], {
       stdio: 'inherit',
-      env: { ...process.env, AUTOPG_CONFIG_DIR: tmpConfigDir },
+      env: daemonEnv,
     });
 
     cli(['config', 'set', 'postgres.shared_buffers', '256MB']);
 
     execFileSync(process.execPath, [WRAPPER, 'restart'], {
       stdio: 'inherit',
-      env: { ...process.env, AUTOPG_CONFIG_DIR: tmpConfigDir },
+      env: daemonEnv,
     });
 
     // Give postgres a moment to come back up.

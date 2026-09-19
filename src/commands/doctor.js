@@ -38,6 +38,8 @@ import { createRequire } from 'node:module';
 import { spawnSync } from 'node:child_process';
 
 const require = createRequire(import.meta.url);
+const { PM2_PROCESS_NAME } = require('../lib/service-state.cjs');
+const { describePm2Persistence, inspectPm2Persistence } = require('../lib/pm2-persistence.cjs');
 import { getAdminFilePath, readAdminJson, SUPERVISOR_VALUES } from '../lib/admin-json.js';
 import { resolveSocketDir } from '../lib/socket-dir.js';
 import { readRuntimeJson, isLiveRuntime } from '../lib/runtime-json.js';
@@ -259,7 +261,7 @@ function checkSupervisorLiveness(admin) {
   }
   switch (admin.supervisor) {
     case 'pm2': {
-      const r = pm2EntryOnline('autopg-server');
+      const r = pm2EntryOnline(PM2_PROCESS_NAME);
       return r.ok
         ? check('supervisor_liveness', 'pm2 autopg-server entry online', SEVERITY.PASS)
         : check('supervisor_liveness', 'pm2 autopg-server entry not online', SEVERITY.FAIL, r.reason, 'run `pgserve install` to (re-)register pm2 entry');
@@ -285,6 +287,28 @@ function checkSupervisorLiveness(admin) {
     default:
       return check('supervisor_liveness', `unknown supervisor: ${admin.supervisor}`, SEVERITY.FAIL);
   }
+}
+
+/**
+ * A live pm2 entry only survives a pm2 daemon restart if `pm2 save` captured
+ * it. Compares the live entry with dump.pm2 (executable, args — port, data
+ * dir, socket dir — and supervision limits). Issue #144.
+ */
+function checkPm2Persistence(admin, options = {}) {
+  if (admin?.supervisor !== 'pm2') {
+    return check('pm2_persistence', 'pm2 persistence (not supervised by pm2)', SEVERITY.PASS);
+  }
+  const state = inspectPm2Persistence(PM2_PROCESS_NAME, options);
+  if (state.persisted) {
+    return check('pm2_persistence', 'pm2 autopg-server entry is saved for `pm2 resurrect`', SEVERITY.PASS);
+  }
+  const title = state.kind === 'stale'
+    ? 'pm2 autopg-server entry is saved but not running'
+    : 'pm2 autopg-server entry will not survive `pm2 resurrect`';
+  const remedy = state.kind === 'stale'
+    ? 'run `pm2 save --force` (or `autopg uninstall`, which does) unless it should come back'
+    : 'run `pm2 save` (or re-run `autopg install`, which saves it)';
+  return check('pm2_persistence', title, SEVERITY.FAIL, describePm2Persistence(state), remedy);
 }
 
 function checkRuntimeJson(admin) {
@@ -453,6 +477,7 @@ export async function runChecks() {
   try { admin = readAdminJson(); } catch { /* admin_json_shape already reported */ }
 
   findings.push(checkSupervisorLiveness(admin));
+  findings.push(checkPm2Persistence(admin));
   findings.push(checkRuntimeJson(admin));
   findings.push(await checkUdsReachable(admin));
   findings.push(checkPgauditLoaded(admin));
@@ -524,6 +549,7 @@ export const __testInternals = Object.freeze({
   checkAdminJsonShape,
   checkRuntimeJson,
   checkSupervisorLiveness,
+  checkPm2Persistence,
   checkPgauditLoaded,
   exitCodeFor,
   SEVERITY,
