@@ -64,14 +64,15 @@ As of pgserve 2.6.x, three identities ship hardcoded (source:
 | `automagik-pgserve-release` | `pgserve` | `^https://github.com/automagik-dev/autopg/.github/workflows/sign-attest.yml@refs/tags/v.*$` |
 
 All three pin the Sigstore GitHub Actions OIDC issuer
-(`https://token.actions.githubusercontent.com`) and require a tag-triggered
-workflow_run.
+(`https://token.actions.githubusercontent.com`) and require the signing
+workflow to have run at a `refs/tags/v*` ref.
 
 **Why pgserve anchors on `sign-attest.yml`, not `release.yml`**: pgserve has
-TWO release-related workflows. `release.yml` is the npm-publish pipeline
-(modeled on khal-os/desktop) with zero cosign content. `sign-attest.yml` is
+TWO release-related workflows. `release.yml` is the version-bump pipeline
+(modeled on khal-os/desktop; it also published to npm until v3.0.0) with zero
+cosign content. `sign-attest.yml` is
 the cosign signing pipeline (Group 8 of the autopg-distribution-cutover
-cohort). Renaming `sign-attest.yml` → `release.yml` would clobber the npm
+cohort). Renaming `sign-attest.yml` → `release.yml` would clobber that
 workflow, so the trust regex anchors on the actual signing workflow file
 (Wave A PR-A1 fix, mirror of `automagik-dev/genie` PR #1725).
 
@@ -93,11 +94,11 @@ manifest.json                                       # aggregate metadata
 Per-platform pipeline (see `.github/workflows/`):
 
 ```
-git push origin v<version>
-   ├── triggers build-tarballs.yml  → assembles autopg-<v>-<plat>.tar.gz + .sha256
+release.yml (bump job) tags v<version>, or: git push origin v<version>
+   ├── build-tarballs.yml @ tag     → assembles autopg-<v>-<plat>.tar.gz + .sha256
    │     uploads as artifact: autopg-<v>-<plat>
    │
-   └── workflow_run triggers sign-attest.yml
+   └── kick-sign-attest dispatches sign-attest.yml @ tag
          ├── cosign sign-blob (keyless) → .sig + .cert
          ├── attest-build-provenance (SLSA L3) → .intoto.jsonl
          ├── cosign verify-blob (self-check) — gate-fails the run if the cert
@@ -105,17 +106,28 @@ git push origin v<version>
          ├── per-platform Upload signed bundle artifact
          └── aggregate job → autopg-signed-bundle-<v> (all platforms + manifest.json)
                │
-               └── workflow_run triggers release-publish.yml
+               └── kick-release-publish dispatches release-publish.yml @ tag
                      ├── downloads autopg-signed-bundle-<v> (cross-run fetch)
                      ├── sanity-checks every tarball has sig+cert+intoto+sha256 siblings
                      ├── gh release create v<version> + uploads all assets
                      └── updates .well-known/latest.json (stable channel only)
 ```
 
-The chain is strictly serial via `workflow_run` — release-publish never runs
-unless sign-attest succeeded. Closes the race window that previously shipped
-releases with no signing artifacts (v2.6.0 + v2.6.1 baseline per engineer
-T25 audit).
+The chain is strictly serial: each workflow dispatches the next one
+(`gh workflow run --ref v<version>`) from a final job that only runs when
+everything before it succeeded, so release-publish never runs unless
+sign-attest verified. Closes the race window that previously shipped releases
+with no signing artifacts (v2.6.0 + v2.6.1 baseline per engineer T25 audit).
+
+The hops are explicit dispatches, not `workflow_run` triggers, for two reasons.
+GitHub raises no follow-on events for a run started with `GITHUB_TOKEN`, which
+is how `release.yml` starts the build, so a `workflow_run` hop never fired. And
+a `workflow_run` run executes at the default branch: its certificate would read
+`sign-attest.yml@refs/heads/main`, which the regex above rejects.
+
+Rebuilding or re-signing an existing tag by hand does **not** continue the
+chain. Pass `-f release=true` to build-tarballs (or `-f publish=true` to
+sign-attest) to opt in.
 
 ## Verification recipes
 
