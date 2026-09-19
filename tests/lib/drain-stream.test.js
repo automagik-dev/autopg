@@ -85,13 +85,15 @@ describe('drainStream', () => {
 });
 
 // The production failure (#149): postgres writes to a pipe the wrapper reads,
-// and the wrapper's read loop died on its first error. Under Bun a stream that
-// JavaScript stops reading is still pulled from the pipe into native memory
-// without bound, so the wrapper's RSS grows with everything postgres logs
-// (~1.5 GB in the report) until allocation fails, the native reader stalls,
-// the pipe fills and every backend blocks in write(). Two things therefore
-// have to hold: every byte flows through JavaScript (so nothing accumulates
-// natively), and the JavaScript side keeps only a bounded tail of it.
+// and the wrapper's read loop died on its first error. What happens to a
+// piped stream JavaScript stops reading depends on the Bun version: either
+// the pipe fills and the child blocks in write() (Bun 1.3.11 on macOS — the
+// production symptom, every backend parked on its next log line), or Bun
+// keeps pulling it into native memory without bound (Bun 1.3.14 — the
+// wrapper's RSS grows with everything postgres logs, ~1.5 GB in the report,
+// until allocation fails and the reader stalls the same way). Two things
+// therefore have to hold: every byte flows through JavaScript, and the
+// JavaScript side keeps only a bounded tail of it.
 describe('a real child process writing far more than a pipe holds', () => {
   function writeToStderr(bytes) {
     return Bun.spawn(['sh', '-c', `head -c ${bytes} /dev/zero | tr "\\0" x >&2`], { stdout: 'ignore', stderr: 'pipe' });
@@ -127,7 +129,7 @@ describe('a real child process writing far more than a pipe holds', () => {
     expect(failures).toBeGreaterThan(0);
   }, 15_000);
 
-  test('control: the old loop, which stopped reading after one error, buffers the whole output in memory', async () => {
+  test('control: the old loop, which stopped reading after one error, blocks the child or hoards its output', async () => {
     const BYTES = 200_000_000;
     const rssBefore = process.memoryUsage().rss;
     const proc = writeToStderr(BYTES);
@@ -147,14 +149,16 @@ describe('a real child process writing far more than a pipe holds', () => {
       }
     })();
 
-    const outcome = await exitedWithin(proc, 10_000);
+    const outcome = await exitedWithin(proc, 3_000);
     const rssGrowth = process.memoryUsage().rss - rssBefore;
     proc.kill();
+    await proc.exited;
     reader.cancel().catch(() => {});
 
-    expect(outcome.exited).toBe(true);
-    expect(received).toBeLessThan(1_000_000);          // JavaScript saw almost nothing …
-    expect(rssGrowth).toBeGreaterThan(BYTES / 2);      // … yet the process is holding the output.
+    // JavaScript saw almost nothing either way …
+    expect(received).toBeLessThan(1_000_000);
+    // … and the child is stuck on a full pipe, or the process is holding its output.
+    expect(!outcome.exited || rssGrowth > BYTES / 2).toBe(true);
   }, 15_000);
 
   test('drainStream keeps memory flat for the same volume', async () => {
@@ -178,6 +182,8 @@ describe('a real child process writing far more than a pipe holds', () => {
     expect(outcome.exited).toBe(true);
     expect(received).toBe(BYTES);
     expect(tail.toString().length).toBe(64 * 1024);
-    expect(rssGrowth).toBeLessThan(BYTES / 4);
+    // RSS is noisy (allocator slack, other tests' garbage); the abandoned
+    // reader above hoards the full volume, so half of it is a wide margin.
+    expect(rssGrowth).toBeLessThan(BYTES / 2);
   }, 15_000);
 });
