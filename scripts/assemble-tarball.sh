@@ -173,9 +173,11 @@ ensure_console_dist() {
   # node_modules/.bin/bun, and `bun run` puts node_modules/.bin ahead of PATH,
   # so the `bun build …` inside console:build exec'd the stub: "Exec format
   # error" on every release runner (v3.2.1 build). The console build only
-  # needs the bun on PATH; drop the stub.
-  if [[ -e "${REPO_ROOT}/node_modules/.bin/bun" ]]; then
-    rm -f "${REPO_ROOT}/node_modules/.bin/bun"
+  # needs the bun on PATH; drop the stub — only the stub, a dev checkout with
+  # a real npm bun keeps its shim (bin/autopg-wrapper.cjs resolves through it).
+  local shim="${REPO_ROOT}/node_modules/.bin/bun"
+  if [[ -L "$shim" || -e "$shim" ]] && [[ ! -s "$shim" ]]; then
+    rm -f "$shim"
   fi
 
   echo "==> bun run console:build"
