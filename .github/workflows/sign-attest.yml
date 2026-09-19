@@ -5,9 +5,13 @@ name: Sign + Attest Tarballs (autopg)
 # provenance attestation per platform, then aggregates a top-level
 # manifest.json for release-publish.yml to consume.
 #
-# Trigger: runs after build-tarballs.yml completes successfully (any
-# ref, including tag pushes), or on manual dispatch (workflow_dispatch)
-# — also usable as a callable workflow.
+# Trigger: workflow_dispatch at the release tag — build-tarballs.yml's
+# `kick-sign-attest` job does this for a release; an operator can too. Also
+# usable as a callable workflow.
+#
+# There is deliberately no `workflow_run` trigger: such a run executes at the
+# default branch, so the certificate would say …@refs/heads/main and every
+# consumer would reject it (see the trust regex note below).
 #
 # Signing is cosign keyless (OIDC via GitHub Actions). No secrets
 # required; the id-token: write permission below mints OIDC tokens on
@@ -25,15 +29,6 @@ name: Sign + Attest Tarballs (autopg)
 #   dist/manifest.json
 
 on:
-  workflow_run:
-    workflows: ["Build Tarballs (autopg)"]
-    types: [completed]
-    # Wave A (v2.6.x) — Mismatch 5 fix: the `branches:` filter excluded
-    # tag refs, so on a `git push origin v*` build-tarballs.yml ran but
-    # this workflow never fired (release-publish then shipped zero
-    # signing artifacts). Dropping the filter makes workflow_run fire on
-    # every successful build-tarballs run, including tag pushes that
-    # produce the actual release artifacts.
   workflow_dispatch:
     inputs:
       version:
@@ -44,6 +39,11 @@ on:
         description: 'build-tarballs.yml run ID to download artifacts from'
         required: false
         type: string
+      publish:
+        description: 'Continue the release chain: dispatch a public, stable release-publish once signing verifies'
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       version:
@@ -73,7 +73,6 @@ jobs:
   # ---------------------------------------------------------------------------
   sign:
     name: Sign ${{ matrix.platform }}
-    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -113,9 +112,9 @@ jobs:
           name: autopg-${{ steps.ver.outputs.version }}-${{ matrix.platform }}
           path: dist
           # Cross-workflow downloads need the run-id of the upstream
-          # build-tarballs job. workflow_run gives us this for free;
-          # workflow_dispatch / workflow_call accept it as input.
-          run-id: ${{ github.event.workflow_run.id || inputs.run_id || github.run_id }}
+          # build-tarballs job; workflow_dispatch / workflow_call accept it
+          # as input.
+          run-id: ${{ inputs.run_id || github.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install cosign
@@ -174,7 +173,7 @@ jobs:
           TARBALL="dist/autopg-${VERSION}-${PLATFORM}.tar.gz"
           # Keyless verify: anchor on this workflow's own path + a
           # permissive ref-tail (covers tag refs in production runs and
-          # branch refs during workflow_run-internal CI). The strict
+          # branch refs when an operator dispatches from a branch). The strict
           # consumer-facing trust regex in src/cosign/trust-list.js
           # tightens this to refs/tags/v.*.
           cosign verify-blob \
@@ -309,3 +308,42 @@ jobs:
             dist/manifest.json
           retention-days: 30
           if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Hand off to release-publish — explicit dispatch, at the tag. Same reasoning
+  # as `kick-sign-attest` in build-tarballs.yml: a `workflow_run` hop never
+  # fires after a GITHUB_TOKEN-started run.
+  #
+  # Only when the caller asked for it (`publish: true`, which build-tarballs
+  # passes for a release). Re-signing an old tag by hand stops here.
+  # ---------------------------------------------------------------------------
+  kick-release-publish:
+    name: Dispatch release-publish at the tag
+    needs: [aggregate]
+    if: github.event_name == 'workflow_dispatch' && github.ref_type == 'tag' && inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write   # `gh workflow run` creates a workflow_dispatch event
+      contents: read
+    steps:
+      - name: Dispatch release-publish.yml
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh workflow run release-publish.yml \
+               --repo "${{ github.repository }}" \
+               --ref "${TAG}" \
+               -f version="${VERSION}" \
+               -f sign_run_id="${{ github.run_id }}" \
+               -f channel=stable \
+               -f draft=false; then
+            echo "::notice::dispatched release-publish.yml @ ${TAG} (version=${VERSION}, sign_run_id=${{ github.run_id }})"
+          else
+            echo "::error::could not dispatch release-publish.yml — v${VERSION} is signed but NOT published. Recover with: gh workflow run release-publish.yml --ref ${TAG} -f version=${VERSION} -f sign_run_id=${{ github.run_id }} -f channel=stable -f draft=false"
+            exit 1
+          fi
