@@ -61,6 +61,14 @@ function pm2GetProcess(name = PM2_PROCESS_NAME) {
   }
 }
 
+/**
+ * Supervisor recorded in admin.json at install time (`pm2`, `systemd-user`,
+ * `launchd`, `external`), or null when nothing is recorded.
+ */
+function readRecordedSupervisor(env = process.env) {
+  return readJson(path.join(getConfigDir(env), 'admin.json'))?.supervisor || null;
+}
+
 function evaluateServiceState({
   supervisor,
   supervisorStatus,
@@ -181,6 +189,8 @@ module.exports = {
   evaluateServiceState,
   formatServiceState,
   inspectServiceState,
+  pm2GetProcess,
+  readRecordedSupervisor,
   waitForServiceReadiness,
   _internals: {
     getConfigDir,

@@ -14,24 +14,17 @@ const { execFileSync, spawnSync } = require('node:child_process');
 const {
   PM2_PROCESS_NAME,
   formatServiceState,
+  pm2GetProcess,
+  readRecordedSupervisor,
   waitForServiceReadiness,
 } = require('./lib/service-state.cjs');
 
-function pm2GetProcess(name = PM2_PROCESS_NAME) {
-  try {
-    const output = execFileSync('pm2', ['jlist'], {
-      encoding: 'utf8',
-      timeout: 5_000,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    const processes = JSON.parse(output);
-    return Array.isArray(processes)
-      ? processes.find((entry) => entry?.name === name) || null
-      : null;
-  } catch {
-    return null;
-  }
-}
+// Restart commands for the supervisors `autopg restart` does not drive
+// itself. Unit names match the liveness probes in src/commands/doctor.js.
+const EXTERNAL_RESTART_HINTS = {
+  'systemd-user': 'systemctl --user restart autopg.service',
+  launchd: 'launchctl kickstart -k "gui/$(id -u)/dev.automagik.autopg"',
+};
 
 function pm2IsAvailable() {
   try {
@@ -71,6 +64,18 @@ async function dispatch(_args = [], ctx = {}) {
   const getProcess = ctx.pm2GetProcess || pm2GetProcess;
   const restart = ctx.restartViaPm2 || restartViaPm2;
   const waitUntilReady = ctx.waitForServiceReadiness || waitForServiceReadiness;
+  const readSupervisor = ctx.readSupervisor || readRecordedSupervisor;
+
+  // admin.json records who owns the postmaster. When that is not pm2,
+  // pointing the operator at `autopg install` would be wrong.
+  const supervisor = readSupervisor();
+  if (supervisor && supervisor !== 'pm2') {
+    const hint = EXTERNAL_RESTART_HINTS[supervisor];
+    return fail(
+      `AutoPG is supervised by ${supervisor}, not pm2; `
+      + (hint ? `restart it with \`${hint}\`` : 'restart it through that supervisor'),
+    );
+  }
 
   if (!isAvailable()) {
     return fail('pm2 is unavailable; cannot restart the configured AutoPG service');

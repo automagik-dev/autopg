@@ -4,12 +4,46 @@
  * Strategy:
  *   - Inject PM2 and readiness stubs through the dispatch context so tests
  *     exercise lifecycle decisions without touching the host supervisor.
+ *   - Point AUTOPG_CONFIG_DIR at an empty tempdir so the recorded-supervisor
+ *     lookup never reads the developer's real ~/.autopg/admin.json.
  */
 
-import { test, expect, describe } from 'bun:test';
+import { test, expect, describe, beforeEach, afterEach } from 'bun:test';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
+
+let tmpHome;
+let originalConfigDir;
+
+beforeEach(() => {
+  tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'autopg-restart-'));
+  originalConfigDir = process.env.AUTOPG_CONFIG_DIR;
+  process.env.AUTOPG_CONFIG_DIR = tmpHome;
+});
+
+afterEach(() => {
+  fs.rmSync(tmpHome, { recursive: true, force: true });
+  if (originalConfigDir === undefined) delete process.env.AUTOPG_CONFIG_DIR;
+  else process.env.AUTOPG_CONFIG_DIR = originalConfigDir;
+});
+
+function captureStderr(run) {
+  const original = process.stderr.write;
+  let captured = '';
+  process.stderr.write = (chunk) => {
+    captured += String(chunk);
+    return true;
+  };
+  return Promise.resolve()
+    .then(run)
+    .then((value) => ({ value, stderr: captured }))
+    .finally(() => {
+      process.stderr.write = original;
+    });
+}
 
 function freshRestart() {
   const restartPath = path.join(REPO_ROOT, 'src', 'cli-restart.cjs');
@@ -89,6 +123,47 @@ describe('pm2 supervised path', () => {
       pm2GetProcess: () => null,
     });
     expect(code).toBe(1);
+  });
+});
+
+describe('non-pm2 supervisors', () => {
+  function neverTouchPm2() {
+    throw new Error('pm2 must not be probed when another supervisor owns AutoPG');
+  }
+
+  test('points systemd-user hosts at systemctl instead of `autopg install`', async () => {
+    const restart = freshRestart();
+    const { value, stderr } = await captureStderr(() => restart.dispatch([], {
+      readSupervisor: () => 'systemd-user',
+      pm2IsAvailable: neverTouchPm2,
+      pm2GetProcess: neverTouchPm2,
+      restartViaPm2: neverTouchPm2,
+    }));
+    expect(value).toBe(1);
+    expect(stderr).toContain('supervised by systemd-user');
+    expect(stderr).toContain('systemctl --user restart autopg.service');
+    expect(stderr).not.toContain('autopg install');
+  });
+
+  test('points launchd hosts at launchctl kickstart', async () => {
+    const restart = freshRestart();
+    const { value, stderr } = await captureStderr(() => restart.dispatch([], {
+      readSupervisor: () => 'launchd',
+      pm2IsAvailable: neverTouchPm2,
+    }));
+    expect(value).toBe(1);
+    expect(stderr).toContain('dev.automagik.autopg');
+  });
+
+  test('reads the recorded supervisor from admin.json', async () => {
+    fs.writeFileSync(path.join(tmpHome, 'admin.json'), JSON.stringify({ supervisor: 'external' }));
+    const restart = freshRestart();
+    const { value, stderr } = await captureStderr(() => restart.dispatch([], {
+      pm2IsAvailable: neverTouchPm2,
+    }));
+    expect(value).toBe(1);
+    expect(stderr).toContain('supervised by external');
+    expect(stderr).toContain('restart it through that supervisor');
   });
 });
 
