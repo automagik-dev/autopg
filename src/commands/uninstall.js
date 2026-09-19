@@ -25,14 +25,13 @@
 
 import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
-import { createRequire } from 'node:module';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 
-const require = createRequire(import.meta.url);
-const { persistPm2Registrations } = require('../lib/pm2-persistence.cjs');
-
+// Static import, not createRequire + require: bun compile cannot bundle
+// the latter, which broke the tarball binary (#159; see doctor.js).
+import { persistPm2Registrations } from '../lib/pm2-persistence.cjs';
 import {
   ADMIN_FILE_MODE,
   getAdminFilePath,
