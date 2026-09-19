@@ -1415,6 +1415,29 @@ function dispatch(subcommand, args, ctx) {
       // v3.0.0 verb rename — `upgrade` → `update`. Clean cutover per
       // pgserve-singleton-no-proxy Group 6 + Felipe directive
       // 2026-05-10. `pgserve upgrade` is no longer a recognised verb.
+      //
+      // Issue #160: `--help` / `-h` must return BEFORE the migration
+      // module loads. Same class as #146 (`uninstall --help` tore down
+      // the postmaster): until now `autopg update --help` ran all seven
+      // migration steps against the live install.
+      if (args.includes('--help') || args.includes('-h')) {
+        process.stdout.write(`Usage:
+  autopg update [options]
+
+Idempotent in-place migration: port-reconcile, binary-cache-flush,
+plpgsql-resolve, cosign-meta-migration, env-refresh, consumer-signal,
+health-validate. Safe to re-run any number of times.
+
+Options:
+  --dry-run             Report what each step would do without changing anything
+  --quiet               Only print failures
+  --skip-steps <a,b>    Comma-separated step names to skip
+  --help, -h            Show this help and exit
+
+Exit status: 0 when every step passed or was skipped, 1 otherwise.
+`);
+        return 0;
+      }
       const opts = {
         quiet: args.includes('--quiet'),
         dryRun: args.includes('--dry-run'),
@@ -1424,9 +1447,32 @@ function dispatch(subcommand, args, ctx) {
           return (args[idx + 1] || '').split(',').filter(Boolean);
         })(),
       };
-      return import(require('node:path').join(__dirname, 'update', 'index.js'))
+      // Issue #160: the specifier MUST be a string literal. The previous
+      // form built it at runtime — `path.join(__dirname, 'update',
+      // 'index.js')` — so `bun build --compile` (scripts/build-binary.sh)
+      // could not bundle the module and the binary carried the BUILD
+      // machine's `__dirname` — every v3.2.0 tarball died with
+      //   Cannot find module '/home/runner/work/autopg/autopg/src/update/
+      //   index.js' from '/$bunfs/root/autopg'
+      // A literal `'./update/index.js'` is resolved at bundle time, same
+      // as the `./commands/*.js` verbs above. tests/cli/update-dispatch
+      // .test.js greps this file for the computed form so it cannot return.
+      //
+      // The verb returns its exit code (the wrapper owns process.exit,
+      // like `verify` / `trust`) and owns its own failure path: a module
+      // load or runtime error is reported as `autopg update: <reason>`
+      // and resolves to 1. process.exitCode is set as well so the code
+      // survives even if the caller drops the numeric result — never a
+      // synchronous process.exit(1) here (CV103-2 stdio-flush race, see
+      // the EADDRINUSE handler in cmdInstall).
+      return import('./update/index.js')
         .then((mod) => mod.update(opts))
-        .then((r) => process.exit(r.ok ? 0 : 1));
+        .then((r) => (r.ok ? 0 : 1))
+        .catch((err) => {
+          process.stderr.write(`autopg update: ${err?.message ?? err}\n`);
+          process.exitCode = 1;
+          return 1;
+        });
     }
     case 'config': {
       const cfg = require('./cli-config.cjs');
