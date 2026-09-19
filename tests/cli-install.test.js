@@ -69,10 +69,15 @@ if (args[0] === 'jlist') {
     const processStatus = fs.existsSync(${JSON.stringify(statusFile)})
       ? fs.readFileSync(${JSON.stringify(statusFile)}, 'utf8').trim()
       : 'online';
+    // Real pm2 keeps the args passed after the -- separator and reports them as an
+    // array in pm2_env.args; install reads the registered port from there.
+    const postmasterArgs = fs.existsSync(serviceStatePath)
+      ? JSON.parse(fs.readFileSync(serviceStatePath, 'utf8')).postmasterArgs
+      : undefined;
     process.stdout.write(JSON.stringify([{
       name: 'autopg-server',
       pid: Number(process.env.AUTOPG_TEST_LIVE_PID) || 12345,
-      pm2_env: { status: processStatus, pm_uptime: Date.now() - 1000, restart_time: 0 }
+      pm2_env: { status: processStatus, pm_uptime: Date.now() - 1000, restart_time: 0, args: postmasterArgs }
     }]) + '\\n');
   } else {
     process.stdout.write('[]\\n');
@@ -88,7 +93,8 @@ if (args[0] === 'start') {
     const portIndex = args.lastIndexOf('--port');
     fs.writeFileSync(serviceStatePath, JSON.stringify({
       socketDir: args[socketIndex + 1],
-      port: Number(args[portIndex + 1])
+      port: Number(args[portIndex + 1]),
+      postmasterArgs: args.slice(args.indexOf('--') + 1)
     }));
     refreshRuntime();
   }
@@ -117,6 +123,9 @@ function runCli(args, env = {}) {
     env: {
       ...process.env,
       PGSERVE_CONFIG_DIR: tmpHome,
+      // AUTOPG_CONFIG_DIR takes precedence when a developer has it exported;
+      // pin it too so no test can write to their real config dir.
+      AUTOPG_CONFIG_DIR: tmpHome,
       AUTOPG_TEST_LIVE_PID: String(process.pid),
       XDG_RUNTIME_DIR: path.join(tmpHome, 'runtime'),
       PATH: `${stubBin.dir}:${process.env.PATH}`,
@@ -242,6 +251,40 @@ describe('pgserve install', () => {
 
     expect(fs.readFileSync(configPath, 'utf8')).toBe(configBefore);
     expect(fs.readFileSync(adminPath, 'utf8')).toBe(adminBefore);
+  });
+
+  test('plain re-install adopts the port pm2 registered when config.json is gone', () => {
+    expect(runCli(['install', '--no-ui', '--port', '8490']).status).toBe(0);
+    fs.rmSync(path.join(tmpHome, 'config.json'));
+    fs.rmSync(path.join(tmpHome, 'admin.json'));
+
+    const result = runCli(['install', '--no-ui']);
+    expect(result.status).toBe(0);
+    expect(JSON.parse(fs.readFileSync(path.join(tmpHome, 'config.json'), 'utf8')).port).toBe(8490);
+    expect(JSON.parse(fs.readFileSync(path.join(tmpHome, 'admin.json'), 'utf8')).port).toBe(8490);
+  });
+
+  test('plain re-install heals a config.json that drifted from the registered port', () => {
+    expect(runCli(['install', '--no-ui', '--port', '8490']).status).toBe(0);
+    const configPath = path.join(tmpHome, 'config.json');
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    fs.writeFileSync(configPath, JSON.stringify({ ...config, port: 9999 }));
+
+    const result = runCli(['install', '--no-ui']);
+    expect(result.status).toBe(0);
+    expect(JSON.parse(fs.readFileSync(configPath, 'utf8')).port).toBe(8490);
+  });
+
+  test('a different --port is still refused when only pm2 knows the registered port', () => {
+    expect(runCli(['install', '--no-ui', '--port', '8490']).status).toBe(0);
+    fs.rmSync(path.join(tmpHome, 'config.json'));
+    fs.rmSync(path.join(tmpHome, 'admin.json'));
+
+    const result = runCli(['install', '--no-ui', '--port', '8491']);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('already installed on port 8490');
+    expect(fs.existsSync(path.join(tmpHome, 'config.json'))).toBe(false);
+    expect(fs.existsSync(path.join(tmpHome, 'admin.json'))).toBe(false);
   });
 
   test('re-install repeating the registered --port stays idempotent', () => {
@@ -424,6 +467,43 @@ describe('pgserve unknown verb (B4 v2.6.1)', () => {
 });
 
 describe('pgserve install port pre-flight (B3 v2.6.1)', () => {
+  test('--redeploy to an occupied port fails before the running postmaster is deleted', async () => {
+    expect(runCli(['install', '--no-ui', '--port', '8490']).status).toBe(0);
+    const occupier = net.createServer();
+    await new Promise((resolve) => occupier.listen(0, '127.0.0.1', resolve));
+    const occupiedPort = occupier.address().port;
+    try {
+      const before = readCallLog(stubBin.calls).length;
+      const result = runCli(['install', '--no-ui', '--redeploy', '--port', String(occupiedPort)], {
+        PGSERVE_TEST_SKIP_PORT_PREFLIGHT: '0',
+      });
+      expect(result.status).not.toBe(0);
+      expect(`${result.stderr}${result.stdout}`).toMatch(/port \d+ is already in use|EADDRINUSE/);
+      const after = readCallLog(stubBin.calls).slice(before);
+      expect(after.find((c) => c[0] === 'delete')).toBeUndefined();
+      expect(JSON.parse(fs.readFileSync(path.join(tmpHome, 'config.json'), 'utf8')).port).toBe(8490);
+    } finally {
+      await new Promise((resolve) => occupier.close(resolve));
+    }
+  });
+
+  test('--redeploy on the same port skips the pre-flight our own postmaster would trip', async () => {
+    const occupier = net.createServer();
+    await new Promise((resolve) => occupier.listen(0, '127.0.0.1', resolve));
+    const ownPort = occupier.address().port;
+    try {
+      // The occupier stands in for our own live postmaster holding its port.
+      expect(runCli(['install', '--no-ui', '--port', String(ownPort)]).status).toBe(0);
+      const result = runCli(['install', '--no-ui', '--redeploy'], {
+        PGSERVE_TEST_SKIP_PORT_PREFLIGHT: '0',
+      });
+      expect(result.status).toBe(0);
+      expect(JSON.parse(fs.readFileSync(path.join(tmpHome, 'config.json'), 'utf8')).port).toBe(ownPort);
+    } finally {
+      await new Promise((resolve) => occupier.close(resolve));
+    }
+  });
+
   test('install fails with EADDRINUSE when chosen port is occupied; no side effects', async () => {
     // Bind a tcp listener on a high random port; install should refuse it.
     const occupier = net.createServer();

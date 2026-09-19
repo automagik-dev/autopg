@@ -908,11 +908,32 @@ async function cmdInstall(args, ctx) {
     fail('pm2 not found in PATH. Install with: bun add -g pm2  (or npm i -g pm2). Pass --no-pm2 for CI / Tier B-bound hosts.');
   }
 
-  const port = parsePort(args) ?? readConfig()?.port ?? DEFAULT_PORT;
   const noUi = args.includes('--no-ui');
   const withUi = args.includes('--with-ui');
   const redeploy = args.includes('--redeploy');
   const existingBeforeInstall = pm2GetProcess(PM2_PROCESS_NAME);
+  // Port the registered postmaster really runs on. pm2 replays the args it
+  // was started with, so those win; admin.json and config.json cover entries
+  // that don't expose them.
+  const registeredPort = existingBeforeInstall
+    ? pm2RegisteredPort(existingBeforeInstall) ?? readAdminJsonSync()?.port ?? readConfig()?.port ?? null
+    : null;
+  const requestedPort = parsePort(args);
+  // Without --redeploy the live process is kept, so a different `--port`
+  // can't take effect. Refuse before anything is written: rewriting
+  // config.json/admin.json to a port the postmaster is not on would fail the
+  // readiness wait below and every later `restart`.
+  if (!redeploy && registeredPort != null && requestedPort != null && requestedPort !== registeredPort) {
+    fail(
+      `pm2 process "${PM2_PROCESS_NAME}" is already installed on port ${registeredPort}; `
+      + `re-run with \`--redeploy\` to move it to port ${requestedPort}`,
+    );
+  }
+  const port = requestedPort ?? registeredPort ?? readConfig()?.port ?? DEFAULT_PORT;
+  // Our own postmaster already holds its port, so the bind test would only
+  // see ourselves. Any other port — including a `--redeploy` to a new one —
+  // still gets tested while the old postmaster is alive to fall back on.
+  const portHeldByUs = existingBeforeInstall && (registeredPort == null || registeredPort === port);
 
   // B3 (v2.6.1): pre-flight bind-test the chosen port BEFORE creating
   // pm2 entries / admin.json / data dir. Without this, an operator on
@@ -920,7 +941,7 @@ async function cmdInstall(args, ctx) {
   // while the postmaster crashes silently — divergence between
   // supervisor state and data-plane state. Fail fast with a clear hint.
   try {
-    if (!withUi && !existingBeforeInstall) await assertPortAvailable(port);
+    if (!withUi && !portHeldByUs) await assertPortAvailable(port);
   } catch (err) {
     if (err.code === 'EADDRINUSE') {
       process.stderr.write(`${err.message}\n`);
@@ -1009,18 +1030,6 @@ async function cmdInstall(args, ctx) {
   // even on hosts where the daemon was registered pre-v2.2.3.
   const existing = redeploy ? null : pm2GetProcess(PM2_PROCESS_NAME);
   if (existing) {
-    // The registered entry keeps the port it was started with. Refuse a
-    // different `--port` up front: rewriting config.json/admin.json to a
-    // port the live postmaster is not on would fail this readiness wait and
-    // every later `restart`.
-    const registeredPort = pm2RegisteredPort(existing) ?? readConfig()?.port ?? port;
-    const requestedPort = parsePort(args);
-    if (requestedPort != null && requestedPort !== registeredPort) {
-      fail(
-        `pm2 process "${PM2_PROCESS_NAME}" is already installed on port ${registeredPort}; `
-        + `re-run with \`--redeploy\` to move it to port ${requestedPort}`,
-      );
-    }
     if (existing.pm2_env?.status !== 'online') {
       const startResult = spawnSync('pm2', ['start', PM2_PROCESS_NAME], { stdio: 'inherit' });
       if (startResult.status !== 0) {
@@ -1030,8 +1039,8 @@ async function cmdInstall(args, ctx) {
     // Refresh config in case install was re-run with new flags — but
     // don't tear down the live process. Operators wanting a port change
     // should `uninstall` then `install` (or pass --redeploy).
-    writeConfig({ port: registeredPort, dataDir, registeredAt: readConfig()?.registeredAt ?? new Date().toISOString() });
-    writeSupervisorRecord(adminJson, { supervisor: 'pm2', socketDir, port: registeredPort });
+    writeConfig({ port, dataDir, registeredAt: readConfig()?.registeredAt ?? new Date().toISOString() });
+    writeSupervisorRecord(adminJson, { supervisor: 'pm2', socketDir, port });
     const state = await waitForServiceReadiness();
     if (!state.ready) {
       fail(
