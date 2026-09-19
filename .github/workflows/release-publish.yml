@@ -108,7 +108,7 @@ jobs:
           if [ -n "${{ inputs.channel }}" ]; then
             echo "channel=${{ inputs.channel }}" >> "$GITHUB_OUTPUT"
           else
-            # Default tag pushes to stable; manual dispatches override above.
+            # No channel given: stable.
             echo "channel=stable" >> "$GITHUB_OUTPUT"
           fi
 
@@ -280,9 +280,23 @@ jobs:
           fi
           MANIFEST_LIST=$(IFS=','; echo "${!MANIFEST_FILES[*]}")
           git commit -m "chore(release): update manifests (${MANIFEST_LIST}) → v${VERSION}"
+          # main can move between the fetch above and this push. The commit
+          # only touches .well-known/, so replaying it on the new tip is safe.
+          MANIFEST_COMMIT=$(git rev-parse HEAD)
+          PUSHED=0
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              PUSHED=1
+              break
+            fi
+            echo "::warning::manifest push attempt ${attempt} rejected — replaying on main's new tip"
+            git fetch --no-tags --depth=1 origin main
+            git switch --detach FETCH_HEAD
+            git cherry-pick "${MANIFEST_COMMIT}" || { git cherry-pick --abort || true; break; }
+          done
           # A release whose manifest never lands is invisible to install.sh
           # and `autopg update`, so this must not pass quietly.
-          if ! git push origin HEAD:main; then
+          if [ "${PUSHED}" -ne 1 ]; then
             echo "::error::v${VERSION} is published, but pushing ${MANIFEST_PATHS[*]} to main failed — update it manually or install.sh + autopg update keep resolving the previous version"
             exit 1
           fi

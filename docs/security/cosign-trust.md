@@ -68,10 +68,11 @@ All three pin the Sigstore GitHub Actions OIDC issuer
 workflow to have run at a `refs/tags/v*` ref.
 
 **Why pgserve anchors on `sign-attest.yml`, not `release.yml`**: pgserve has
-TWO release-related workflows. `release.yml` is the npm-publish pipeline
-(modeled on khal-os/desktop) with zero cosign content. `sign-attest.yml` is
+TWO release-related workflows. `release.yml` is the version-bump pipeline
+(modeled on khal-os/desktop; it also published to npm until v3.0.0) with zero
+cosign content. `sign-attest.yml` is
 the cosign signing pipeline (Group 8 of the autopg-distribution-cutover
-cohort). Renaming `sign-attest.yml` → `release.yml` would clobber the npm
+cohort). Renaming `sign-attest.yml` → `release.yml` would clobber that
 workflow, so the trust regex anchors on the actual signing workflow file
 (Wave A PR-A1 fix, mirror of `automagik-dev/genie` PR #1725).
 

@@ -5,12 +5,15 @@ name: Release
 # Two trigger paths into the same workflow:
 #
 #   1. push to main with a hand-bumped package.json (no [skip ci] marker)
-#      -> auto-detect path: prepare reads package.json, checks if v${version}
-#         tag exists, builds + publishes + creates GitHub Release if not.
+#      -> auto-detect path: prepare reads package.json, checks if the
+#         v${version} tag exists, and runs the sanity build if not. It no
+#         longer tags or publishes (see KNOWN LIMITATION in the `build` job);
+#         cut releases through path 2.
 #
 #   2. workflow_dispatch with bump=patch|minor|major
 #      -> bump job runs `npm version`, commits with [skip ci], tags, pushes.
-#         prepare/build/release continue inline in the same workflow run.
+#         prepare/build continue inline in the same workflow run; the signed
+#         GitHub Release comes from the dispatch chain the bump job starts.
 #
 # Bot-loop guard: bump commits carry [skip ci]. Push of those commits is
 # filtered out by the prepare gate, so the bot's own push does not retrigger.

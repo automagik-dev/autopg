@@ -261,14 +261,20 @@ jobs:
   #      trust regex in src/cosign/trust-list.js (…@refs/tags/v.*) rejects.
   # `workflow_dispatch` is exempt from (1) and `--ref <tag>` fixes (2).
   #
-  # Runs for tag pushes and for dispatches that ask for it (`release: true`,
-  # which release.yml passes). A plain manual rebuild of an old tag stops
-  # here, so it can not republish that version or move latest.json back.
+  # Runs for dispatches that ask for it (`release: true`, which release.yml
+  # passes) and for a pushed plain `vX.Y.Z` tag. A plain manual rebuild of an
+  # old tag stops here, so it can not republish that version or move
+  # latest.json back. So does a pushed prerelease (`v1.2.3-rc.1`) or `autopg-v*`
+  # tag: the chain publishes to the stable channel, and the trust regex only
+  # accepts signatures made at `refs/tags/v*`.
   # ---------------------------------------------------------------------------
   kick-sign-attest:
     name: Dispatch sign-attest at the tag
     needs: [build]
-    if: github.ref_type == 'tag' && (github.event_name == 'push' || inputs.release)
+    if: >-
+      github.ref_type == 'tag' &&
+      (inputs.release ||
+       (github.event_name == 'push' && startsWith(github.ref_name, 'v') && !contains(github.ref_name, '-')))
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
