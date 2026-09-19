@@ -13,7 +13,7 @@
  * - No locale dependency (works on any system)
  */
 
-/* global fetch, Bun */
+/* global fetch, Bun, AbortSignal */
 import { EventEmitter } from 'events';
 import os from 'os';
 import path from 'path';
@@ -21,6 +21,12 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { loadEffectiveConfig } from './settings-loader.cjs';
 import { buildPostgresArgs } from './settings-pg-args.cjs';
+import {
+  PGVECTOR_POOL_URL,
+  parsePgvectorDebFilename,
+  pgvectorDebUrl,
+  resolvePgvectorDebVersions,
+} from './pgvector-version.js';
 
 /**
  * Get platform key for binary lookup (e.g., 'windows-x64', 'linux-x64', 'darwin-arm64')
@@ -1313,7 +1319,13 @@ export class PostgresManager extends EventEmitter {
     try {
       await this._installPgvectorFromDeb({ pgMajor, ...paths });
     } catch (error) {
-      this.logger.warn({ err: error.message }, 'Failed to install pgvector extension files (non-fatal)');
+      // Non-fatal for the postmaster, but never quiet: the message names the
+      // versions tried and the AUTOPG_PGVECTOR_DEB / AUTOPG_PGVECTOR_VERSION
+      // escape hatches (issue #145).
+      this.logger.warn(
+        { err: error.message, pgMajor },
+        'Failed to install pgvector extension files (non-fatal) — CREATE EXTENSION vector will fail until fixed',
+      );
     }
   }
 
@@ -1421,16 +1433,12 @@ export class PostgresManager extends EventEmitter {
       return;
     }
 
-    // Download prebuilt pgvector .deb from apt.postgresql.org (HTTPS)
-    // Version 0.8.1-2 — update when new releases ship
-    const pgvectorVersion = '0.8.1-2';
-    const debUrl = `https://apt.postgresql.org/pub/repos/apt/pool/main/p/pgvector/postgresql-${pgMajor}-pgvector_${pgvectorVersion}.pgdg%2B1_${arch}.deb`;
-    this.logger.info({ url: debUrl, pgMajor }, 'Downloading pgvector...');
-
-    const res = await fetch(debUrl);
-    if (!res.ok) throw new Error(`Download failed: ${res.status}`);
-
-    const buffer = Buffer.from(await res.arrayBuffer());
+    // Obtain the .deb: a local file (AUTOPG_PGVECTOR_DEB, no network) or a
+    // download from the pgdg pool. pgdg garbage-collects superseded
+    // packages, so the version is resolved from the pool listing instead of
+    // being pinned (issue #145); `resolvePgvectorDebVersions` documents the
+    // pin / pool / fallback precedence.
+    const { buffer, pgvectorVersion, sourceUrl } = await this._obtainPgvectorDeb({ pgMajor, arch });
 
     // Extract .deb (it's an ar archive containing data.tar.xz)
     const tmpDir = path.join(os.tmpdir(), `pgserve-pgvector-${process.pid}-${Date.now()}`);
@@ -1484,16 +1492,71 @@ export class PostgresManager extends EventEmitter {
       this._writePgvectorMeta(vectorMeta, {
         pgMajor,
         pgvectorVersion,
-        sourceUrl: debUrl,
+        sourceUrl,
         postgresPath: this.binaries.postgres,
         installedAt: new Date().toISOString(),
       });
 
-      this.logger.info({ pgMajor, pgvectorVersion }, 'pgvector extension installed successfully');
+      this.logger.info({ pgMajor, pgvectorVersion, sourceUrl }, 'pgvector extension installed successfully');
     } finally {
       // Always clean up tmpdir, even on failure
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
+  }
+
+  /**
+   * Return the pgvector .deb bytes plus the version/source to record in
+   * `vector.meta.json`.
+   *
+   * - `AUTOPG_PGVECTOR_DEB=<file>`: read the local file, skip the network.
+   * - Otherwise resolve candidate versions (pin → pool listing → fallback
+   *   list) and download the first one that exists. Every miss is logged;
+   *   when all candidates fail the error names each attempt and the
+   *   `AUTOPG_PGVECTOR_DEB` / `AUTOPG_PGVECTOR_VERSION` escape hatches so
+   *   the non-fatal warning upstream is actionable.
+   */
+  async _obtainPgvectorDeb({ pgMajor, arch }) {
+    const localDeb = (process.env.AUTOPG_PGVECTOR_DEB || '').trim();
+    if (localDeb) {
+      if (!fs.existsSync(localDeb)) {
+        throw new Error(`AUTOPG_PGVECTOR_DEB points at a missing file: ${localDeb}`);
+      }
+      const pgvectorVersion = parsePgvectorDebFilename(localDeb) || 'local';
+      this.logger.info({ file: localDeb, pgMajor, pgvectorVersion }, 'Installing pgvector from local .deb (AUTOPG_PGVECTOR_DEB)');
+      return { buffer: fs.readFileSync(localDeb), pgvectorVersion, sourceUrl: `file://${path.resolve(localDeb)}` };
+    }
+
+    const resolved = await resolvePgvectorDebVersions({ pgMajor, arch });
+    if (resolved.source === 'fallback') {
+      this.logger.warn(
+        { err: resolved.error, versions: resolved.versions },
+        'pgvector pool listing unavailable — trying known versions in order',
+      );
+    } else {
+      this.logger.debug({ source: resolved.source, versions: resolved.versions }, 'Resolved pgvector .deb candidates');
+    }
+
+    const attempts = [];
+    for (const version of resolved.versions) {
+      const url = pgvectorDebUrl({ pgMajor, arch, version });
+      this.logger.info({ url, pgMajor, pgvectorVersion: version }, 'Downloading pgvector...');
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+        if (!res.ok) {
+          attempts.push(`${version} (HTTP ${res.status})`);
+          continue;
+        }
+        return { buffer: Buffer.from(await res.arrayBuffer()), pgvectorVersion: version, sourceUrl: url };
+      } catch (err) {
+        attempts.push(`${version} (${err && err.message ? err.message : String(err)})`);
+      }
+    }
+
+    throw new Error(
+      `pgvector .deb download failed for PostgreSQL ${pgMajor}/${arch} — tried ${attempts.join(', ')}. `
+      + `Workaround: download postgresql-${pgMajor}-pgvector_<ver>.pgdg+1_${arch}.deb from ${PGVECTOR_POOL_URL} `
+      + 'and restart with AUTOPG_PGVECTOR_DEB=<file>, or pin a known version with AUTOPG_PGVECTOR_VERSION=<ver>.',
+    );
   }
 
   /**

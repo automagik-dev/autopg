@@ -27,6 +27,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import readline from 'node:readline';
 
 import {
   ADMIN_FILE_MODE,
@@ -164,18 +165,107 @@ function emit(level, msg, silent) {
   stream.write(`autopg: ${msg}\n`);
 }
 
+const UNINSTALL_USAGE = `Usage: autopg uninstall [options]
+
+Stop and remove the pm2-supervised autopg processes (autopg-server, autopg-ui)
+and clear the supervisor record from ~/.autopg/admin.json.
+
+Preserved: the data directory (~/.autopg/data), config.json, settings.json and
+the admin Basic-Auth credentials — \`autopg install\` brings everything back.
+
+Options:
+  -y, --yes    Skip the confirmation prompt. Required on a non-interactive
+               terminal (scripts, CI, pipes).
+  -h, --help   Show this help and exit.
+
+Examples:
+  autopg uninstall          # prompts before stopping the postmaster
+  autopg uninstall --yes    # non-interactive
+`;
+
+const CONFIRM_PROMPT = 'This stops autopg-server/autopg-ui under pm2 (data dir preserved). Continue? [y/N] ';
+
+function printUninstallUsage(stream = process.stdout) {
+  stream.write(UNINSTALL_USAGE);
+}
+
 /**
- * Run the uninstall flow. Returns a numeric exit code.
+ * Parse `autopg uninstall` argv. Pure — exported for tests.
+ *
+ * @param {string[]} [argv]
+ * @returns {{help: boolean, yes: boolean, unknown: string[]}}
+ */
+export function parseUninstallArgs(argv = []) {
+  const out = { help: false, yes: false, unknown: [] };
+  for (const arg of argv) {
+    if (arg === '--help' || arg === '-h') out.help = true;
+    else if (arg === '--yes' || arg === '-y') out.yes = true;
+    else out.unknown.push(arg);
+  }
+  return out;
+}
+
+function isInteractive() {
+  return Boolean(process.stdin.isTTY && process.stdout.isTTY);
+}
+
+function askConfirmation(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(/^y(es)?$/i.test(String(answer).trim()));
+    });
+  });
+}
+
+/**
+ * Run the uninstall flow. Resolves to a numeric exit code.
+ *
+ * Order matters (issue #146): `--help` and argument validation return
+ * BEFORE any pm2 call, and the postmaster is only stopped after an explicit
+ * confirmation — an interactive `[y/N]` prompt on a TTY, or `--yes` / `-y`
+ * (mandatory on a non-interactive terminal, which returns 2 otherwise).
  *
  * @param {object} [opts]
+ * @param {string[]} [opts.argv] — the subcommand's arguments (everything
+ *   after `uninstall`).
+ * @param {boolean} [opts.yes] — programmatic equivalent of `--yes`.
  * @param {string} [opts.configDir] — override the autopg config dir (used
  *   by tests; production code should leave this undefined and let env vars
  *   resolve).
  * @param {boolean} [opts.silent] — suppress stdout/stderr writes.
  */
-export function runUninstall(opts = {}) {
+export async function runUninstall(opts = {}) {
   const configDir = opts.configDir || getConfigDir();
   const silent = opts.silent === true;
+  const args = parseUninstallArgs(Array.isArray(opts.argv) ? opts.argv : []);
+
+  if (args.help) {
+    printUninstallUsage(process.stdout);
+    return 0;
+  }
+  if (args.unknown.length > 0) {
+    process.stderr.write(`autopg: uninstall: unknown option ${args.unknown.join(' ')}\n`);
+    printUninstallUsage(process.stderr);
+    return 2;
+  }
+
+  if (!(args.yes || opts.yes === true)) {
+    if (!isInteractive()) {
+      emit(
+        'err',
+        'uninstall stops autopg-server/autopg-ui under pm2 (data dir preserved); refusing without confirmation on a non-interactive terminal. Re-run with --yes.',
+        silent,
+      );
+      return 2;
+    }
+    const confirmed = await askConfirmation(CONFIRM_PROMPT);
+    if (!confirmed) {
+      emit('out', 'uninstall aborted; nothing changed', silent);
+      return 1;
+    }
+  }
 
   const pm2Available = pm2IsAvailable();
   if (!pm2Available) {

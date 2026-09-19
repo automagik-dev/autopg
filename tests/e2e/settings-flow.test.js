@@ -281,7 +281,7 @@ describe.skipIf(!RUN_DAEMON_E2E)('e2e: full daemon leg (gated)', () => {
 
   afterAll(() => {
     try {
-      execFileSync(process.execPath, [WRAPPER, 'uninstall'], {
+      execFileSync(process.execPath, [WRAPPER, 'uninstall', '--yes'], {
         stdio: 'ignore',
         env: { ...process.env, AUTOPG_CONFIG_DIR: tmpConfigDir },
       });

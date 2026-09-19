@@ -15,6 +15,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 
+import { parseUninstallArgs } from '../../src/commands/uninstall.js';
+
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 const BIN = path.join(REPO_ROOT, 'bin', 'autopg-wrapper.cjs');
 
@@ -151,7 +153,7 @@ describe('autopg uninstall — pm2 teardown', () => {
     spawnSync(path.join(stubBin.dir, 'pm2'), ['start', '/dev/null', '--name', 'autopg-server']);
     spawnSync(path.join(stubBin.dir, 'pm2'), ['start', '/dev/null', '--name', 'autopg-ui']);
 
-    const result = runCli(['uninstall']);
+    const result = runCli(['uninstall', '--yes']);
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('uninstalled');
     expect(result.stdout).toContain('autopg-server');
@@ -168,7 +170,7 @@ describe('autopg uninstall — pm2 teardown', () => {
     fs.writeFileSync(path.join(tmpHome, 'data', 'pgdata-marker'), 'keep-me');
     spawnSync(path.join(stubBin.dir, 'pm2'), ['start', '/dev/null', '--name', 'autopg-server']);
 
-    runCli(['uninstall']);
+    runCli(['uninstall', '--yes']);
 
     expect(fs.existsSync(path.join(tmpHome, 'data', 'pgdata-marker'))).toBe(true);
     expect(fs.readFileSync(path.join(tmpHome, 'data', 'pgdata-marker'), 'utf8')).toBe('keep-me');
@@ -191,7 +193,7 @@ describe('autopg uninstall — admin.json supervisor clear', () => {
       rotatedAt: null,
     });
 
-    const result = runCli(['uninstall']);
+    const result = runCli(['uninstall', '--yes']);
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('cleared supervisor record');
 
@@ -216,7 +218,7 @@ describe('autopg uninstall — admin.json supervisor clear', () => {
       port: 5432,
       installedAt: '2026-05-08T07:30:00.000Z',
     });
-    const result = runCli(['uninstall']);
+    const result = runCli(['uninstall', '--yes']);
     expect(result.status).toBe(0);
     expect(fs.existsSync(path.join(tmpHome, 'admin.json'))).toBe(false);
   });
@@ -230,7 +232,7 @@ describe('autopg uninstall — admin.json supervisor clear', () => {
       rotatedAt: null,
     });
     const before = readAdminJsonOnDisk();
-    runCli(['uninstall']);
+    runCli(['uninstall', '--yes']);
     const after = readAdminJsonOnDisk();
     expect(after).toEqual(before);
   });
@@ -247,18 +249,18 @@ describe('autopg uninstall — idempotency', () => {
       installedAt: '2026-05-08T07:30:00.000Z',
     });
 
-    const first = runCli(['uninstall']);
+    const first = runCli(['uninstall', '--yes']);
     expect(first.status).toBe(0);
     expect(first.stdout).toContain('uninstalled');
 
-    const second = runCli(['uninstall']);
+    const second = runCli(['uninstall', '--yes']);
     expect(second.status).toBe(0);
     expect(second.stdout).toContain('not registered');
     expect(second.stdout).toContain('nothing to uninstall');
   });
 
   test('uninstall on a clean host (no pm2 entries, no admin.json) exits 0 with diagnostic', () => {
-    const result = runCli(['uninstall']);
+    const result = runCli(['uninstall', '--yes']);
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('not registered');
     expect(result.stdout).toContain('nothing to uninstall');
@@ -273,7 +275,7 @@ describe('autopg uninstall — install round-trip (no Tier-B-refusal false posit
       port: 5432,
       installedAt: '2026-05-08T07:30:00.000Z',
     });
-    runCli(['uninstall']);
+    runCli(['uninstall', '--yes']);
 
     // --no-pm2 keeps the install fully hermetic (no real pm2 register
     // needed) and still exercises the assertSupervisor path. On a clean
@@ -293,7 +295,7 @@ describe('autopg uninstall — install round-trip (no Tier-B-refusal false posit
 describe('autopg uninstall — audit log', () => {
   test('appends one JSONL entry with event=autopg_uninstall to <configDir>/audit.log', () => {
     spawnSync(path.join(stubBin.dir, 'pm2'), ['start', '/dev/null', '--name', 'autopg-server']);
-    runCli(['uninstall']);
+    runCli(['uninstall', '--yes']);
 
     const auditFile = path.join(tmpHome, 'audit.log');
     expect(fs.existsSync(auditFile)).toBe(true);
@@ -304,5 +306,104 @@ describe('autopg uninstall — audit log', () => {
     expect(last.ts).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(last.pm2Available).toBe(true);
     expect(Array.isArray(last.pm2)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #146: `autopg uninstall --help` executed the uninstall (args were
+// dropped at the dispatcher) and took down a live postmaster. `--help`,
+// bad flags and the confirmation gate must all return BEFORE any pm2 call.
+// runCli() spawns with piped stdio, so every test below is non-TTY.
+// ---------------------------------------------------------------------------
+
+describe('autopg uninstall — --help never touches pm2 (issue #146)', () => {
+  const SUPERVISOR = { supervisor: 'pm2', socketDir: '/tmp/x', port: 8432, installedAt: 'now' };
+
+  test('--help prints usage, exits 0, makes no pm2 call, leaves admin.json alone', () => {
+    seedAdminJson(SUPERVISOR);
+    const result = runCli(['uninstall', '--help']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('Usage: autopg uninstall');
+    expect(result.stdout).toContain('--yes');
+    expect(readCallLog(stubBin.calls)).toEqual([]);
+    expect(readAdminJsonOnDisk()).toEqual(SUPERVISOR);
+  });
+
+  test('-h is an alias for --help', () => {
+    const result = runCli(['uninstall', '-h']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('Usage: autopg uninstall');
+    expect(readCallLog(stubBin.calls)).toEqual([]);
+  });
+
+  test('--help wins even when combined with --yes', () => {
+    seedAdminJson(SUPERVISOR);
+    const result = runCli(['uninstall', '--yes', '--help']);
+    expect(result.status).toBe(0);
+    expect(readCallLog(stubBin.calls)).toEqual([]);
+    expect(readAdminJsonOnDisk()).toEqual(SUPERVISOR);
+  });
+
+  test('unknown flag prints usage on stderr, exits 2, makes no pm2 call', () => {
+    seedAdminJson(SUPERVISOR);
+    const result = runCli(['uninstall', '--nuke']);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('unknown option --nuke');
+    expect(result.stderr).toContain('Usage: autopg uninstall');
+    expect(result.stdout).toBe('');
+    expect(readCallLog(stubBin.calls)).toEqual([]);
+    expect(readAdminJsonOnDisk()).toEqual(SUPERVISOR);
+  });
+});
+
+describe('autopg uninstall — confirmation gate', () => {
+  const SUPERVISOR = { supervisor: 'pm2', socketDir: '/tmp/x', port: 8432, installedAt: 'now' };
+
+  test('non-TTY without --yes exits 2 with a --yes hint and tears nothing down', () => {
+    runCli(['install', '--port', '18432']);
+    seedAdminJson(SUPERVISOR);
+    fs.writeFileSync(path.join(stubBin.dir, 'registered-autopg-server'), '');
+    const before = readCallLog(stubBin.calls).length;
+
+    const result = runCli(['uninstall']);
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain('--yes');
+    expect(result.stderr).toContain('data dir preserved');
+
+    const after = readCallLog(stubBin.calls).slice(before);
+    expect(after.filter((c) => c[0] === 'delete')).toEqual([]);
+    expect(fs.existsSync(path.join(stubBin.dir, 'registered-autopg-server'))).toBe(true);
+    expect(readAdminJsonOnDisk()).toEqual(SUPERVISOR);
+  });
+
+  test('--yes runs the existing teardown path', () => {
+    seedAdminJson(SUPERVISOR);
+    fs.writeFileSync(path.join(stubBin.dir, 'registered-autopg-server'), '');
+    const result = runCli(['uninstall', '--yes']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('uninstalled pm2 entries: autopg-server');
+    expect(readCallLog(stubBin.calls).some((c) => c[0] === 'delete' && c[1] === 'autopg-server')).toBe(true);
+    expect(readAdminJsonOnDisk()).toBeNull();
+  });
+
+  test('-y is an alias for --yes', () => {
+    seedAdminJson(SUPERVISOR);
+    const result = runCli(['uninstall', '-y']);
+    expect(result.status).toBe(0);
+    expect(readAdminJsonOnDisk()).toBeNull();
+  });
+});
+
+describe('parseUninstallArgs (pure)', () => {
+  test('recognises help / yes and their short aliases', () => {
+    expect(parseUninstallArgs([])).toEqual({ help: false, yes: false, unknown: [] });
+    expect(parseUninstallArgs(['--help'])).toEqual({ help: true, yes: false, unknown: [] });
+    expect(parseUninstallArgs(['-h'])).toEqual({ help: true, yes: false, unknown: [] });
+    expect(parseUninstallArgs(['--yes'])).toEqual({ help: false, yes: true, unknown: [] });
+    expect(parseUninstallArgs(['-y'])).toEqual({ help: false, yes: true, unknown: [] });
+  });
+
+  test('collects unknown tokens', () => {
+    expect(parseUninstallArgs(['--force', 'extra'])).toEqual({ help: false, yes: false, unknown: ['--force', 'extra'] });
   });
 });

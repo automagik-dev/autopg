@@ -133,7 +133,7 @@ this README and in `console/` use `autopg`.
 autopg [options]                       # foreground server (alias: pgserve)
 autopg daemon                          # long-lived background daemon
 autopg install [--port N] [--data P]   # register pgserve under pm2
-autopg uninstall                       # remove from pm2 (data dir kept)
+autopg uninstall [--yes]               # remove from pm2 (data dir kept); confirms first
 autopg status                          # pm2 + on-disk config snapshot
 autopg url | autopg port               # canonical connection string / port
 autopg config <list|get|set|edit|path|init>   # manage ~/.autopg/settings.json
@@ -254,7 +254,7 @@ autopg install --data /data/pg    # custom data dir
 autopg url                        # postgres://localhost:8432/postgres
 autopg port                       # 8432
 autopg status                     # pm2 + on-disk config snapshot
-autopg uninstall                  # remove from pm2; keep data dir
+autopg uninstall                  # remove from pm2; keep data dir (prompts; --yes for scripts)
 ```
 
 **Hardened defaults** (tuned for production-grade Postgres workloads,
@@ -647,6 +647,21 @@ pgserve --ram --pgvector
 ```
 
 When `--pgvector` is enabled, every new database automatically has the vector extension installed. No SQL setup required.
+
+On Linux the `vector` extension files are fetched once from the pgdg apt pool
+(`postgresql-<major>-pgvector_<ver>.pgdg+1_<arch>.deb`). The version is
+resolved from the pool listing at install time (highest wins) because pgdg
+removes superseded packages; if the listing is unreachable a short list of
+known versions is tried in order. Overrides:
+
+| Env var | Effect |
+|---|---|
+| `AUTOPG_PGVECTOR_VERSION=<ver>` | Pin one pool version (e.g. `0.8.6-1`) instead of resolving. |
+| `AUTOPG_PGVECTOR_DEB=<file.deb>` | Install a local `.deb`; no network access. |
+
+A failed install never stops the postmaster, but it is logged with the
+versions tried and the override to use; `CREATE EXTENSION vector` fails until
+it is fixed.
 
 <details>
 <summary><b>Using pgvector</b></summary>

@@ -272,7 +272,7 @@ describe('pgserve install', () => {
 
   test('autopg uninstall tears down both autopg-server and autopg-ui', () => {
     runCli(['install']);
-    runCli(['uninstall']);
+    runCli(['uninstall', '--yes']);
     const calls = readCallLog(stubBin.calls);
     const deletes = calls.filter((c) => c[0] === 'delete');
     const deletedNames = deletes.map((c) => c[1]);
@@ -636,7 +636,7 @@ describe('pgserve uninstall', () => {
     runCli(['install']);
     expect(fs.existsSync(path.join(tmpHome, 'config.json'))).toBe(true);
 
-    const result = runCli(['uninstall']);
+    const result = runCli(['uninstall', '--yes']);
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('uninstalled');
 
@@ -648,7 +648,7 @@ describe('pgserve uninstall', () => {
   });
 
   test('uninstall when not installed is a no-op success', () => {
-    const result = runCli(['uninstall']);
+    const result = runCli(['uninstall', '--yes']);
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('not registered');
   });

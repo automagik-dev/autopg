@@ -1308,7 +1308,11 @@ function dispatch(subcommand, args, ctx) {
       // alongside `src/lib/pm2-args.js` instead of inside this legacy
       // dispatcher. dispatch() returns a Promise here; the wrapper
       // already handles both numeric and Promise returns.
-      return import('./commands/uninstall.js').then((mod) => mod.runUninstall());
+      //
+      // `args` MUST be forwarded (issue #146): without it `--help` was
+      // silently dropped and `autopg uninstall --help` tore down the
+      // postmaster instead of printing usage.
+      return import('./commands/uninstall.js').then((mod) => mod.runUninstall({ argv: args }));
     case 'doctor':
       // pgserve-singleton-no-proxy Group 3: read-only V1. Reports the
       // active supervisor + postmaster reachability + admin.json /
