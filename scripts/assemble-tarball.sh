@@ -168,6 +168,16 @@ ensure_console_dist() {
     [[ $rc -eq 0 ]] || return 1
   fi
 
+  # package.json depends on the npm `bun` package, whose postinstall is what
+  # fetches the real binary. With --ignore-scripts that leaves a stub at
+  # node_modules/.bin/bun, and `bun run` puts node_modules/.bin ahead of PATH,
+  # so the `bun build …` inside console:build exec'd the stub: "Exec format
+  # error" on every release runner (v3.2.1 build). The console build only
+  # needs the bun on PATH; drop the stub.
+  if [[ -e "${REPO_ROOT}/node_modules/.bin/bun" ]]; then
+    rm -f "${REPO_ROOT}/node_modules/.bin/bun"
+  fi
+
   echo "==> bun run console:build"
   (cd "$REPO_ROOT" && bun run console:build) || return 1
   console_dist_is_built || {
