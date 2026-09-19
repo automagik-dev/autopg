@@ -76,6 +76,14 @@ describe('drainStream', () => {
     expect(errors).toEqual(['read:EPIPE']);
   });
 
+  test('a locked stream is reported instead of rejecting the un-awaited drain', async () => {
+    const stream = streamOf(['x']);
+    stream.getReader(); // lock it
+    const errors = [];
+    await drainStream(stream, { onChunk: () => {}, onError: (error, phase) => errors.push(`${phase}:${error.constructor.name}`) });
+    expect(errors).toEqual(['read:TypeError']);
+  });
+
   test('decodes a multi-byte character split across two chunks', async () => {
     const bytes = new TextEncoder().encode('ação');
     const seen = [];
@@ -129,8 +137,11 @@ describe('a real child process writing far more than a pipe holds', () => {
     expect(failures).toBeGreaterThan(0);
   }, 15_000);
 
+  // Volumes are sized for the slowest CI leg: BSD `tr` on the macOS runner
+  // manages roughly 30 MB/s, and the windows below must leave real margin
+  // for the reader that keeps up while still catching one that does not.
   test('control: the old loop, which stopped reading after one error, blocks the child or hoards its output', async () => {
-    const BYTES = 200_000_000;
+    const BYTES = 60_000_000;
     const rssBefore = process.memoryUsage().rss;
     const proc = writeToStderr(BYTES);
     const reader = proc.stderr.getReader();
@@ -149,7 +160,7 @@ describe('a real child process writing far more than a pipe holds', () => {
       }
     })();
 
-    const outcome = await exitedWithin(proc, 3_000);
+    const outcome = await exitedWithin(proc, 10_000);
     const rssGrowth = process.memoryUsage().rss - rssBefore;
     proc.kill();
     await proc.exited;
@@ -157,12 +168,13 @@ describe('a real child process writing far more than a pipe holds', () => {
 
     // JavaScript saw almost nothing either way …
     expect(received).toBeLessThan(1_000_000);
-    // … and the child is stuck on a full pipe, or the process is holding its output.
-    expect(!outcome.exited || rssGrowth > BYTES / 2).toBe(true);
+    // … and the child is stuck on a full pipe (it would finish in ~2 s if
+    // anyone read), or the process is holding the whole output.
+    expect(!outcome.exited || rssGrowth > BYTES).toBe(true);
   }, 15_000);
 
   test('drainStream keeps memory flat for the same volume', async () => {
-    const BYTES = 200_000_000;
+    const BYTES = 60_000_000;
     const rssBefore = process.memoryUsage().rss;
     const proc = writeToStderr(BYTES);
     const tail = createBoundedTail(64 * 1024);
@@ -182,8 +194,8 @@ describe('a real child process writing far more than a pipe holds', () => {
     expect(outcome.exited).toBe(true);
     expect(received).toBe(BYTES);
     expect(tail.toString().length).toBe(64 * 1024);
-    // RSS is noisy (allocator slack, other tests' garbage); the abandoned
-    // reader above hoards the full volume, so half of it is a wide margin.
-    expect(rssGrowth).toBeLessThan(BYTES / 2);
+    // Draining costs a fixed ~16 MB of allocator slack whatever the volume;
+    // the abandoned reader above grows by the whole volume.
+    expect(rssGrowth).toBeLessThan(32 * 1024 * 1024);
   }, 15_000);
 });

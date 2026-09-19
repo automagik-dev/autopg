@@ -47,8 +47,6 @@ export function createBoundedTail(limit) {
  * @returns {Promise<void>} resolves when the stream is exhausted or broken
  */
 export async function drainStream(stream, { onChunk, onError = () => {} }) {
-  const reader = stream.getReader();
-  const decoder = new TextDecoder();
   const report = (error, phase) => {
     try {
       onError(error, phase);
@@ -56,6 +54,25 @@ export async function drainStream(stream, { onChunk, onError = () => {} }) {
       // A broken error handler must not stop the drain either.
     }
   };
+  const deliver = (text) => {
+    if (!text) return;
+    try {
+      onChunk(text);
+    } catch (error) {
+      report(error, 'chunk');
+    }
+  };
+
+  // Callers fire this without awaiting it, so nothing here may reject —
+  // a locked or missing stream is reported like a broken one.
+  let reader;
+  try {
+    reader = stream.getReader();
+  } catch (error) {
+    report(error, 'read');
+    return;
+  }
+  const decoder = new TextDecoder();
 
   while (true) {
     let result;
@@ -65,11 +82,10 @@ export async function drainStream(stream, { onChunk, onError = () => {} }) {
       report(error, 'read');
       return;
     }
-    if (result.done) return;
-    try {
-      onChunk(decoder.decode(result.value, { stream: true }));
-    } catch (error) {
-      report(error, 'chunk');
+    if (result.done) {
+      deliver(decoder.decode()); // flush a trailing partial character
+      return;
     }
+    deliver(decoder.decode(result.value, { stream: true }));
   }
 }
