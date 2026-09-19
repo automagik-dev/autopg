@@ -168,6 +168,18 @@ ensure_console_dist() {
     [[ $rc -eq 0 ]] || return 1
   fi
 
+  # package.json depends on the npm `bun` package, whose postinstall is what
+  # fetches the real binary. With --ignore-scripts that leaves a stub at
+  # node_modules/.bin/bun, and `bun run` puts node_modules/.bin ahead of PATH,
+  # so the `bun build …` inside console:build exec'd the stub: "Exec format
+  # error" on every release runner (v3.2.1 build). The console build only
+  # needs the bun on PATH; drop the stub — only the stub, a dev checkout with
+  # a real npm bun keeps its shim (bin/autopg-wrapper.cjs resolves through it).
+  local shim="${REPO_ROOT}/node_modules/.bin/bun"
+  if [[ -L "$shim" || -e "$shim" ]] && [[ ! -s "$shim" ]]; then
+    rm -f "$shim"
+  fi
+
   echo "==> bun run console:build"
   (cd "$REPO_ROOT" && bun run console:build) || return 1
   console_dist_is_built || {
