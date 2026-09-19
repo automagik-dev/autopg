@@ -100,6 +100,17 @@ if (args[0] === 'start') {
   }
   process.exit(${exitCode});
 }
+if (args[0] === 'save') {
+  if (process.env.AUTOPG_TEST_PM2_SAVE_FAIL === '1') process.exit(1);
+  const registered = fs.existsSync(${JSON.stringify(path.join(dir, 'registered'))});
+  const state = fs.existsSync(serviceStatePath) ? JSON.parse(fs.readFileSync(serviceStatePath, 'utf8')) : {};
+  fs.mkdirSync(process.env.PM2_HOME, { recursive: true });
+  fs.writeFileSync(
+    path.join(process.env.PM2_HOME, 'dump.pm2'),
+    JSON.stringify(registered ? [{ name: 'autopg-server', args: state.postmasterArgs }] : [])
+  );
+  process.exit(0);
+}
 if (args[0] === 'delete') {
   try { fs.unlinkSync(${JSON.stringify(path.join(dir, 'registered'))}); } catch {}
   try { fs.unlinkSync(${JSON.stringify(statusFile)}); } catch {}
@@ -126,6 +137,9 @@ function runCli(args, env = {}) {
       // AUTOPG_CONFIG_DIR takes precedence when a developer has it exported;
       // pin it too so no test can write to their real config dir.
       AUTOPG_CONFIG_DIR: tmpHome,
+      // pm2's saved process list lives under PM2_HOME; keep it in the tempdir
+      // so nothing reads or rewrites the developer's real ~/.pm2/dump.pm2.
+      PM2_HOME: path.join(tmpHome, 'pm2'),
       AUTOPG_TEST_LIVE_PID: String(process.pid),
       XDG_RUNTIME_DIR: path.join(tmpHome, 'runtime'),
       PATH: `${stubBin.dir}:${process.env.PATH}`,
@@ -223,6 +237,57 @@ describe('pgserve install', () => {
     const calls2 = readCallLog(stubBin.calls);
     const startCount2 = calls2.filter((c) => c[0] === 'start').length;
     expect(startCount2).toBe(1); // no second start
+  });
+
+  // Issue #144: `pm2 start` is live-only; without `pm2 save` the entry is
+  // gone after the next `pm2 resurrect`.
+  function readDump() {
+    return JSON.parse(fs.readFileSync(path.join(tmpHome, 'pm2', 'dump.pm2'), 'utf8'));
+  }
+  function saveCalls() {
+    return readCallLog(stubBin.calls).filter((c) => c[0] === 'save').length;
+  }
+
+  test('install on a host with a pre-existing pm2 dump persists the registration', () => {
+    fs.mkdirSync(path.join(tmpHome, 'pm2'), { recursive: true });
+    fs.writeFileSync(path.join(tmpHome, 'pm2', 'dump.pm2'), JSON.stringify([{ name: 'omni-api' }]));
+
+    const result = runCli(['install', '--no-ui', '--port', '8490']);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('pm2 save');
+    expect(saveCalls()).toBe(1);
+
+    const saved = readDump().find((entry) => entry.name === 'autopg-server');
+    expect(saved).toBeDefined();
+    expect(saved.args).toContain('--port');
+    expect(saved.args).toContain('8490');
+    expect(JSON.parse(runCli(['status', '--json']).stdout).persisted).toBe(true);
+  });
+
+  test('re-install with nothing changed does not save again', () => {
+    expect(runCli(['install', '--no-ui']).status).toBe(0);
+    expect(saveCalls()).toBe(1);
+    expect(runCli(['install', '--no-ui']).status).toBe(0);
+    expect(saveCalls()).toBe(1);
+  });
+
+  test('--no-save leaves the registration live-only, warns, and status reports it', () => {
+    const result = runCli(['install', '--no-ui', '--no-save']);
+    expect(result.status).toBe(0);
+    expect(saveCalls()).toBe(0);
+    expect(result.stderr).toContain('--no-save');
+    expect(result.stderr).toContain('pm2 resurrect');
+
+    const status = runCli(['status', '--json']);
+    expect(JSON.parse(status.stdout).persisted).toBe(false);
+    expect(runCli(['status']).stdout).toContain('persisted   no');
+  });
+
+  test('install fails loudly when the registration cannot be made durable', () => {
+    const result = runCli(['install', '--no-ui'], { AUTOPG_TEST_PM2_SAVE_FAIL: '1' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('could not be made durable');
+    expect(result.stderr).toContain('--no-save');
   });
 
   test('an existing stopped pm2 entry is started and must become ready', () => {

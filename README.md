@@ -257,6 +257,16 @@ autopg status                     # readiness + pm2 state + on-disk config snaps
 autopg uninstall                  # remove from pm2; keep data dir (prompts; --yes for scripts)
 ```
 
+`autopg install` also runs `pm2 save` when the registration is not yet in pm2's
+saved process list. `pm2 start` only registers with the running daemon; after a
+daemon restart (`pm2 resurrect`, which is what the `pm2 startup` unit runs at
+boot) pm2 restores what was saved, so an unsaved `autopg-server` would silently
+stay down while its consumers come back. `pm2 save` snapshots your whole pm2
+process list; pass `--no-save` to manage that yourself. `autopg doctor` fails the
+`pm2_persistence` check, and `autopg status --json` reports `persisted: false`,
+when the live entry and the saved one differ. `autopg uninstall` saves too, so a
+removed entry does not come back.
+
 `autopg status --json` reports readiness, not just the pm2 state: `status` is
 `ready`, `degraded`, `stopped` or `failed`, and `ready` is `true` only when pm2
 is online **and** the live postmaster matches the configured port. The raw pm2
