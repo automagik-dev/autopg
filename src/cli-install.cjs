@@ -624,11 +624,23 @@ function ok(message) {
 }
 
 /**
- * Resolve the autopg wrapper used to launch the UI under pm2. The wrapper
- * lives next to `postgres-server.js` (same `bin/` dir).
+ * Resolve what pm2 launches for `autopg-ui`: the launcher that dispatched
+ * this install, since both launchers handle the `ui` verb natively.
+ *
+ *   npm / repo checkout → `bin/autopg-wrapper.cjs` (ctx.wrapperPath — a
+ *                         node script next to `postgres-server.js`)
+ *   release tarball     → the compiled `autopg` binary itself
+ *                         (bin/autopg-cli.js passes process.execPath as
+ *                         both scriptPath and wrapperPath)
+ *
+ * Deriving `<dir of scriptPath>/autopg-wrapper.cjs` only fits the first
+ * layout: a tarball has no `bin/` and no wrapper, so every release install
+ * used to skip the console (issue #161). The sibling lookup stays as the
+ * fallback for callers that pass no wrapperPath.
  */
-function getUiBinPath(scriptPath) {
-  return path.join(path.dirname(scriptPath), 'autopg-wrapper.cjs');
+function getUiBinPath(ctx) {
+  if (ctx.wrapperPath) return ctx.wrapperPath;
+  return path.join(path.dirname(ctx.scriptPath), 'autopg-wrapper.cjs');
 }
 
 /**
@@ -686,9 +698,12 @@ function cmdInstallUi(ctx, options = {}) {
     return 0;
   }
 
-  const uiBinPath = getUiBinPath(ctx.scriptPath);
+  const uiBinPath = getUiBinPath(ctx);
   if (!fs.existsSync(uiBinPath)) {
-    note(`UI bin not found at ${uiBinPath}; skipping UI install`);
+    note(
+      `console launcher not found at ${uiBinPath}; skipping UI install `
+        + '(daemon is unaffected — run `autopg ui` manually)',
+    );
     return 0;
   }
 
@@ -714,7 +729,10 @@ function cmdInstallUi(ctx, options = {}) {
   const pm2Args = buildUiPm2StartArgs({ uiBinPath, uiPort, uiHost });
   const result = spawnSync('pm2', pm2Args, { stdio: 'inherit' });
   if (result.status !== 0) {
-    note(`UI install failed (exit ${result.status}); daemon is unaffected. Run \`autopg ui\` manually.`);
+    note(
+      `UI install failed (pm2 start ${uiBinPath} exited ${result.status}); daemon is unaffected. `
+        + `Logs: ${getLogsDir()}/${UI_PM2_PROCESS_NAME}-error.log. Run \`autopg ui\` manually.`,
+    );
     return 0;
   }
   ok(`UI ${refresh && existing ? 'refreshed' : 'installed'}: pm2 process "${UI_PM2_PROCESS_NAME}" on http://${uiHost}:${uiPort}`);
