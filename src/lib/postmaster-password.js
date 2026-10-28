@@ -48,31 +48,38 @@ export function resolvePostmasterPassword(env = process.env) {
  * password never goes through argv, env, SQL or a log. Refused unless the
  * path is absolute and names a regular file (not a symlink) owned by this
  * user with no group or other permission bits, holding one non-empty line.
- * One trailing newline is dropped, as initdb's --pwfile does. Errors name
- * the path and the reason, never the content.
+ * The file is opened once (no symlink followed, no blocking on a FIFO) and
+ * the checks run on what was opened, so a swap after the check cannot be
+ * read. One trailing newline is dropped, as initdb's --pwfile does. Errors
+ * name the path and the reason, never the content.
  */
 export function readPasswordFile(filePath) {
   const refuse = (reason) => new Error(`password file ${filePath}: ${reason}`);
   if (typeof filePath !== 'string' || !path.isAbsolute(filePath)) {
     throw refuse('the path must be absolute');
   }
-  let stat;
+  const { O_RDONLY, O_NOFOLLOW = 0, O_NONBLOCK = 0 } = fs.constants;
+  let fd;
   try {
-    stat = fs.lstatSync(filePath);
+    fd = fs.openSync(filePath, O_RDONLY | O_NOFOLLOW | O_NONBLOCK);
   } catch (err) {
+    if (err.code === 'ELOOP') throw refuse('it is a symlink');
     throw refuse(`cannot read it (${err.code ?? err.message})`);
   }
-  if (stat.isSymbolicLink()) throw refuse('it is a symlink');
-  if (!stat.isFile()) throw refuse('it is not a regular file');
-  if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
-    throw refuse('it is not owned by this user');
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) throw refuse('it is not a regular file');
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+      throw refuse('it is not owned by this user');
+    }
+    if ((stat.mode & 0o077) !== 0) {
+      throw refuse(`its mode is ${(stat.mode & 0o777).toString(8).padStart(4, '0')}; it must be 0600 or stricter`);
+    }
+    const password = fs.readFileSync(fd, 'utf8').replace(/\r?\n$/, '');
+    if (password.length === 0) throw refuse('it is empty');
+    if (/[\r\n]/.test(password)) throw refuse('it must hold one line');
+    return password;
+  } finally {
+    fs.closeSync(fd);
   }
-  if ((stat.mode & 0o077) !== 0) {
-    throw refuse(`its mode is ${(stat.mode & 0o777).toString(8).padStart(4, '0')}; it must be 0600 or stricter`);
-  }
-  const text = fs.readFileSync(filePath, 'utf8');
-  const password = text.replace(/\r?\n$/, '');
-  if (password.length === 0) throw refuse('it is empty');
-  if (/[\r\n]/.test(password)) throw refuse('it must hold one line');
-  return password;
 }

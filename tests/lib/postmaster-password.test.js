@@ -10,7 +10,7 @@
  * chain from settings-schema.cjs `server.pgPassword`.
  */
 
-import { test, expect, describe, beforeEach, afterEach } from 'bun:test';
+import { test, expect, describe, beforeEach, afterEach, spyOn } from 'bun:test';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -133,6 +133,28 @@ describe('readPasswordFile', () => {
 
   test('refuses a directory', () => {
     expect(refusal(dir)).toContain('regular file');
+  });
+
+  test('refuses a FIFO without blocking on it', () => {
+    const fifo = path.join(dir, 'fifo');
+    expect(spawnSync('mkfifo', ['-m', '600', fifo]).status).toBe(0);
+    expect(refusal(fifo)).toContain('regular file');
+  });
+
+  test('opens the path once and checks and reads what it opened', () => {
+    const file = write('once', `${content}\n`);
+    const spies = ['openSync', 'lstatSync', 'statSync', 'readFileSync'].map((name) => spyOn(fs, name));
+    const [open, lstat, stat, read] = spies;
+    try {
+      expect(readPasswordFile(file)).toBe(content);
+      expect(open.mock.calls.filter(([target]) => target === file)).toHaveLength(1);
+      expect(lstat).not.toHaveBeenCalled();
+      expect(stat).not.toHaveBeenCalled();
+      expect(read.mock.calls.length).toBeGreaterThan(0);
+      expect(read.mock.calls.every(([target]) => typeof target === 'number')).toBe(true);
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
   });
 
   test.each([0o644, 0o640, 0o604, 0o660])('refuses mode %o', (mode) => {

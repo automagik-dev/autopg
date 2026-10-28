@@ -16,7 +16,7 @@
  */
 
 import { PostgresManager } from '../src/postgres.js';
-import { resolvePostmasterPassword, readPasswordFile } from '../src/lib/postmaster-password.js';
+import { resolvePostmasterPassword } from '../src/lib/postmaster-password.js';
 import { resolveSocketDir, ensureSocketDir } from '../src/lib/socket-dir.js';
 import { writeRuntimeJson, clearRuntimeJson } from '../src/lib/runtime-json.js';
 import { createLogger } from '../src/logger.js';
@@ -91,15 +91,9 @@ async function runPostmasterSubcommand(postmasterArgs) {
   const { password, source: passwordSource } = resolvePostmasterPassword();
   if (opts.credentialFile !== undefined) {
     // --password-file: scram-only cluster (see PostgresManager credentialFile).
-    // Checked here so a bad file stops us before anything is created.
+    // The manager opens the file once, before it creates anything.
     if (passwordSource !== 'default') {
       console.error(`pgserve postmaster: --password-file and ${passwordSource} are both set; use one`);
-      process.exit(1);
-    }
-    try {
-      readPasswordFile(opts.credentialFile);
-    } catch (err) {
-      console.error(`pgserve postmaster: ${err.message}`);
       process.exit(1);
     }
     logger.info({ source: 'password-file' }, 'pgserve postmaster: using managed superuser password');
@@ -143,6 +137,12 @@ async function runPostmasterSubcommand(postmasterArgs) {
     await manager.start();
   } catch (err) {
     logger.error({ err: err.message }, 'pgserve postmaster: failed to start');
+    // start() can fail after postgres is up (the admin pool refused); stop
+    // it, or it outlives us with PPID 1, holding the port and data dir.
+    await manager.stop().catch((stopErr) => {
+      logger.warn({ err: stopErr.message }, 'pgserve postmaster: stop after a failed start failed');
+      manager.process?.kill('SIGKILL');
+    });
     process.exit(1);
   }
 
