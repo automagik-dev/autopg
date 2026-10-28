@@ -95,9 +95,9 @@ inline next to the offending control.
   env and argv passes `postmaster --password-file <path>` instead (an
   absolute path to a `0600` file holding one line; it cannot be
   combined with the env vars). pgserve opens the file once at every
-  start, before it creates anything; initdb gets the password on stdin
-  and the admin pool logs in with it. pgserve never sends the password
-  as SQL. That cluster's `pg_hba.conf` is rewritten at every start to
+  start, before it fetches or initializes anything; initdb gets the
+  password on stdin and the admin pool logs in with it. pgserve never
+  sends the password as SQL. That cluster's `pg_hba.conf` is rewritten at every start to
   the single line `host all all 127.0.0.1/32 scram-sha-256`, postgres
   listens on `127.0.0.1` only and `hba_file` points at that file.
   `postgres._extra` and the curated `log_statement` and
