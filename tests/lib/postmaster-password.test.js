@@ -10,17 +10,25 @@
  * chain from settings-schema.cjs `server.pgPassword`.
  */
 
-import { test, expect, describe } from 'bun:test';
+import { test, expect, describe, beforeEach, afterEach } from 'bun:test';
 import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import {
   resolvePostmasterPassword,
+  readPasswordFile,
   POSTMASTER_PASSWORD_ENV_VARS,
   DEFAULT_POSTMASTER_PASSWORD,
 } from '../../src/lib/postmaster-password.js';
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 const POSTGRES_SERVER = path.join(REPO_ROOT, 'bin', 'postgres-server.js');
+
+/** A throwaway secret made at run time, so no test holds a literal one. */
+function fakeSecret(label) {
+  return `${label}-${crypto.randomUUID().replaceAll('-', '').slice(0, 16)}`;
+}
 
 describe('resolvePostmasterPassword', () => {
   test('defaults to the built-in password with an empty environment', () => {
@@ -70,5 +78,146 @@ describe('postmaster --help documents the managed password env', () => {
     });
     expect(result.stdout).toContain('AUTOPG_PG_PASSWORD');
     expect(result.stdout).toContain('PGSERVE_PG_PASSWORD');
+  });
+});
+
+describe('readPasswordFile', () => {
+  const content = fakeSecret('file');
+  let dir;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'autopg-pwfile-unit-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function write(name, text, mode = 0o600) {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, text, { mode });
+    fs.chmodSync(file, mode);
+    return file;
+  }
+
+  function refusal(file) {
+    try {
+      readPasswordFile(file);
+    } catch (err) {
+      return err.message;
+    }
+    return null;
+  }
+
+  test('reads the password and drops one trailing newline', () => {
+    expect(readPasswordFile(write('a', `${content}\n`))).toBe(content);
+    expect(readPasswordFile(write('b', `${content}\r\n`))).toBe(content);
+    expect(readPasswordFile(write('c', content))).toBe(content);
+  });
+
+  test('refuses a relative path', () => {
+    write('rel', `${content}\n`);
+    expect(refusal('rel')).toContain('absolute');
+  });
+
+  test('refuses a missing file', () => {
+    expect(refusal(path.join(dir, 'missing'))).toContain('cannot read');
+  });
+
+  test('refuses a symlink', () => {
+    const target = write('target', `${content}\n`);
+    const link = path.join(dir, 'link');
+    fs.symlinkSync(target, link);
+    expect(refusal(link)).toContain('symlink');
+  });
+
+  test('refuses a directory', () => {
+    expect(refusal(dir)).toContain('regular file');
+  });
+
+  test.each([0o644, 0o640, 0o604, 0o660])('refuses mode %o', (mode) => {
+    expect(refusal(write(`m${mode}`, `${content}\n`, mode))).toContain('0600');
+  });
+
+  test('refuses an empty file', () => {
+    expect(refusal(write('empty', ''))).toContain('empty');
+    expect(refusal(write('nl', '\n'))).toContain('empty');
+  });
+
+  test('refuses more than one line', () => {
+    expect(refusal(write('two', `${content}\nsecond\n`))).toContain('one line');
+  });
+
+  test('no refusal echoes the content', () => {
+    const files = [
+      write('m644', `${content}\n`, 0o644),
+      write('two2', `${content}\nsecond\n`),
+    ];
+    for (const file of files) {
+      expect(refusal(file)).not.toContain(content);
+    }
+  });
+});
+
+describe('postmaster --password-file refusals', () => {
+  let dir;
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'autopg-pwfile-cli-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  function postmaster(args, env = {}) {
+    return spawnSync(
+      process.execPath,
+      [POSTGRES_SERVER, 'postmaster', '--port', '1', '--data', path.join(dir, 'data'),
+        '--socket-dir', path.join(dir, 'sock'), ...args],
+      {
+        encoding: 'utf8',
+        timeout: 10000,
+        env: { PATH: process.env.PATH, HOME: dir, AUTOPG_CONFIG_DIR: path.join(dir, 'config'), ...env },
+      },
+    );
+  }
+
+  test('a world-readable file stops the postmaster before anything starts', () => {
+    const file = path.join(dir, 'pw');
+    const fileSecret = fakeSecret('cli');
+    fs.writeFileSync(file, `${fileSecret}\n`, { mode: 0o644 });
+    fs.chmodSync(file, 0o644);
+    const result = postmaster(['--password-file', file]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('0600');
+    expect(result.stdout + result.stderr).not.toContain(fileSecret);
+    expect(fs.existsSync(path.join(dir, 'data'))).toBe(false);
+  });
+
+  test('--password-file together with a password env var is refused', () => {
+    const file = path.join(dir, 'pw');
+    const fileSecret = fakeSecret('cli');
+    const envSecret = fakeSecret('env');
+    fs.writeFileSync(file, `${fileSecret}\n`, { mode: 0o600 });
+    const result = postmaster(['--password-file', file], { AUTOPG_PG_PASSWORD: envSecret });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('AUTOPG_PG_PASSWORD');
+    expect(result.stdout + result.stderr).not.toContain(fileSecret);
+    expect(result.stdout + result.stderr).not.toContain(envSecret);
+  });
+
+  test('--password-file needs a value', () => {
+    const result = postmaster(['--password-file']);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('--password-file');
+  });
+
+  test('help text documents --password-file', () => {
+    const result = spawnSync(process.execPath, [POSTGRES_SERVER, 'postmaster', '--help'], {
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    expect(result.stdout).toContain('--password-file');
   });
 });

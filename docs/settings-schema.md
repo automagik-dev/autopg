@@ -91,7 +91,15 @@ inline next to the offending control.
 - `server.pgUser` — Backend superuser.
 - `server.pgPassword` — Backend superuser password. The file is
   written with mode `0600`; do not commit `~/.autopg/settings.json`
-  to source control.
+  to source control. A supervisor that must keep the password out of
+  env and argv passes `postmaster --password-file <path>` instead (an
+  absolute path to a `0600` file holding one line; it cannot be
+  combined with the env vars). initdb reads that file by path and the
+  admin pool reads it at every start. That cluster's `pg_hba.conf` is
+  rewritten at every start to the single line
+  `host all all 127.0.0.1/32 scram-sha-256`, postgres listens on
+  `127.0.0.1` only, and `log_statement` is pinned to `none` (no pgaudit,
+  no `log_statement=all` fallback). Unix-socket logins are refused.
 
 ### `runtime` — logging + provisioning + data dir
 

@@ -19,6 +19,9 @@
  * file cannot lock the pool out with a blank password.
  */
 
+import fs from 'node:fs';
+import path from 'node:path';
+
 export const POSTMASTER_PASSWORD_ENV_VARS = ['AUTOPG_PG_PASSWORD', 'PGSERVE_PG_PASSWORD'];
 
 export const DEFAULT_POSTMASTER_PASSWORD = 'postgres';
@@ -37,4 +40,39 @@ export function resolvePostmasterPassword(env = process.env) {
     }
   }
   return { password: DEFAULT_POSTMASTER_PASSWORD, source: 'default' };
+}
+
+/**
+ * Read the superuser password from a file the supervisor owns
+ * (`postmaster --password-file <path>`). The file is the only channel: the
+ * password never goes through argv, env, SQL or a log. Refused unless the
+ * path is absolute and names a regular file (not a symlink) owned by this
+ * user with no group or other permission bits, holding one non-empty line.
+ * One trailing newline is dropped, as initdb's --pwfile does. Errors name
+ * the path and the reason, never the content.
+ */
+export function readPasswordFile(filePath) {
+  const refuse = (reason) => new Error(`password file ${filePath}: ${reason}`);
+  if (typeof filePath !== 'string' || !path.isAbsolute(filePath)) {
+    throw refuse('the path must be absolute');
+  }
+  let stat;
+  try {
+    stat = fs.lstatSync(filePath);
+  } catch (err) {
+    throw refuse(`cannot read it (${err.code ?? err.message})`);
+  }
+  if (stat.isSymbolicLink()) throw refuse('it is a symlink');
+  if (!stat.isFile()) throw refuse('it is not a regular file');
+  if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+    throw refuse('it is not owned by this user');
+  }
+  if ((stat.mode & 0o077) !== 0) {
+    throw refuse(`its mode is ${(stat.mode & 0o777).toString(8).padStart(4, '0')}; it must be 0600 or stricter`);
+  }
+  const text = fs.readFileSync(filePath, 'utf8');
+  const password = text.replace(/\r?\n$/, '');
+  if (password.length === 0) throw refuse('it is empty');
+  if (/[\r\n]/.test(password)) throw refuse('it must hold one line');
+  return password;
 }

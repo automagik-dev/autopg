@@ -28,10 +28,15 @@ import {
   resolvePgvectorDebVersions,
 } from './pgvector-version.js';
 import { createBoundedTail, drainStream } from './lib/drain-stream.js';
+import { readPasswordFile } from './lib/postmaster-password.js';
 
 // How much of postgres's stdout/stderr is kept for startup-failure and crash
 // diagnostics. Both only need the end of the output.
 const STARTUP_OUTPUT_TAIL_CHARS = 64 * 1024;
+
+// The whole pg_hba of a password-file cluster: scram over 127.0.0.1 and
+// nothing else, so no trust line, no Unix-socket line and no other host.
+const PASSWORD_FILE_HBA = 'host all all 127.0.0.1/32 scram-sha-256';
 
 /**
  * Get platform key for binary lookup (e.g., 'windows-x64', 'linux-x64', 'darwin-arm64')
@@ -551,6 +556,11 @@ export class PostgresManager extends EventEmitter {
     this.port = options.port ?? 5433; // Internal PG port (router listens on different port)
     this.user = options.user || 'postgres';
     this.password = options.password || 'postgres';
+    // Superuser password file (`postmaster --password-file`). When set it is
+    // the only source of the password; initdb reads it by path, the admin
+    // pool reads it at start, and the cluster is scram-only on 127.0.0.1
+    // with statement logging off (see _runInitDb, _startPostgres).
+    this.credentialFile = options.credentialFile || null;
     this.logger = options.logger;
     this.process = null;
     this.databaseDir = null;
@@ -682,12 +692,26 @@ export class PostgresManager extends EventEmitter {
       port: this.port
     }, this.isTrueRam ? 'PostgreSQL using RAM storage (/dev/shm)' : 'Starting embedded PostgreSQL');
 
+    if (this.credentialFile) {
+      this.password = readPasswordFile(this.credentialFile);
+    }
+
     // Check if data directory is already initialized
     const pgVersionFile = path.join(this.databaseDir, 'PG_VERSION');
     if (!fs.existsSync(pgVersionFile)) {
       await this._runInitDb();
     } else {
       this.logger.debug({ databaseDir: this.databaseDir }, 'Using existing data directory');
+    }
+
+    // Every start, so an edited pg_hba or a cluster made without the file
+    // comes back to scram-only.
+    if (this.credentialFile) {
+      fs.writeFileSync(
+        path.join(this.databaseDir, 'pg_hba.conf'),
+        `# Written by pgserve at every start (--password-file).\n${PASSWORD_FILE_HBA}\n`,
+        { mode: 0o600 },
+      );
     }
 
     // Start PostgreSQL server
@@ -723,11 +747,24 @@ export class PostgresManager extends EventEmitter {
    * Uses Bun.spawn() for ~40% faster process startup
    */
   async _runInitDb() {
-    // Create password file
-    const randomId = crypto.randomBytes(6).toString('hex');
-    const passwordFile = path.join(os.tmpdir(), `pg-password-${randomId}`);
-    await Bun.write(passwordFile, this.password + '\n');
-    await fs.promises.chmod(passwordFile, 0o600); // Secure file permissions
+    // With a caller's password file initdb reads it in place; it is never
+    // copied or removed. Otherwise the password goes to a temp file.
+    const callerFile = this.credentialFile;
+    let initdbInput = callerFile;
+    if (!callerFile) {
+      const randomId = crypto.randomBytes(6).toString('hex');
+      initdbInput = path.join(os.tmpdir(), `pg-password-${randomId}`);
+      await Bun.write(initdbInput, this.password + '\n');
+      await fs.promises.chmod(initdbInput, 0o600); // Secure file permissions
+    }
+    const removeTempFile = async () => {
+      if (callerFile) return;
+      try {
+        await fs.promises.unlink(initdbInput);
+      } catch {
+        // Ignore cleanup errors
+      }
+    };
 
     this.logger.debug({ databaseDir: this.databaseDir }, 'Initializing PostgreSQL data directory');
 
@@ -735,10 +772,9 @@ export class PostgresManager extends EventEmitter {
       const initdbCmd = [
         this.binaries.initdb,
         `--pgdata=${this.databaseDir}`,
-        '--auth-local=trust',
-        '--auth-host=password',
+        ...(callerFile ? ['--auth=scram-sha-256'] : ['--auth-local=trust', '--auth-host=password']),
         `--username=${this.user}`,
-        `--pwfile=${passwordFile}`,
+        `--pwfile=${initdbInput}`,
       ];
       const proc = Bun.spawn(buildCommand(initdbCmd, this.binaries.libDir), {
         env: buildSpawnEnv(this.binaries.libDir),
@@ -755,12 +791,7 @@ export class PostgresManager extends EventEmitter {
       // Wait for process to complete
       const exitCode = await proc.exited;
 
-      // Clean up password file
-      try {
-        await fs.promises.unlink(passwordFile);
-      } catch {
-        // Ignore cleanup errors
-      }
+      await removeTempFile();
 
       if (exitCode === 0) {
         this.logger.debug('initdb completed successfully');
@@ -769,12 +800,7 @@ export class PostgresManager extends EventEmitter {
         throw new Error(`initdb failed with code ${exitCode}: ${stderr || stdout}`);
       }
     } catch (err) {
-      // Clean up password file on error
-      try {
-        await fs.promises.unlink(passwordFile);
-      } catch {
-        // Ignore cleanup errors
-      }
+      await removeTempFile();
       throw new Error(`Failed to run initdb: ${err.message}`);
     }
   }
@@ -937,7 +963,15 @@ export class PostgresManager extends EventEmitter {
       // pm2 captures stderr to `<configDir>/logs/autopg-server-error.log`
       // and `logrotate.d/pgserve` rotates it.
       const pgauditPath = path.join(this.binaries.libDir, '..', 'lib', 'postgresql', 'pgaudit.so');
-      if (fs.existsSync(pgauditPath)) {
+      if (this.credentialFile) {
+        // A password-file cluster logs no statements and listens on
+        // 127.0.0.1 only (its pg_hba has no other host). Last -c wins, so
+        // settings.json cannot turn either back on.
+        pgArgs.push('-c', 'log_statement=none');
+        pgArgs.push('-c', 'listen_addresses=127.0.0.1');
+        appliedGucs.log_statement = 'none';
+        appliedGucs.listen_addresses = '127.0.0.1';
+      } else if (fs.existsSync(pgauditPath)) {
         pgArgs.push('-c', 'shared_preload_libraries=pgaudit');
         pgArgs.push('-c', 'pgaudit.log=all');
         pgArgs.push('-c', 'pgaudit.log_catalog=off');

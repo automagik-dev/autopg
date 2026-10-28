@@ -16,7 +16,7 @@
  */
 
 import { PostgresManager } from '../src/postgres.js';
-import { resolvePostmasterPassword } from '../src/lib/postmaster-password.js';
+import { resolvePostmasterPassword, readPasswordFile } from '../src/lib/postmaster-password.js';
 import { resolveSocketDir, ensureSocketDir } from '../src/lib/socket-dir.js';
 import { writeRuntimeJson, clearRuntimeJson } from '../src/lib/runtime-json.js';
 import { createLogger } from '../src/logger.js';
@@ -83,6 +83,30 @@ async function runPostmasterSubcommand(postmasterArgs) {
   const opts = parsePostmasterArgs(postmasterArgs);
   const logger = createLogger({ level: opts.logLevel });
 
+  // Managed superuser password (AUTOPG_PG_PASSWORD / PGSERVE_PG_PASSWORD,
+  // default 'postgres'). PostgresManager feeds it to initdb's --pwfile on
+  // fresh clusters AND to its TCP admin pool — without this wire a rotated
+  // password crash-loops every postmaster restart (admin pool refused).
+  // Log the SOURCE only, never the value.
+  const { password, source: passwordSource } = resolvePostmasterPassword();
+  if (opts.credentialFile !== undefined) {
+    // --password-file: scram-only cluster (see PostgresManager credentialFile).
+    // Checked here so a bad file stops us before anything is created.
+    if (passwordSource !== 'default') {
+      console.error(`pgserve postmaster: --password-file and ${passwordSource} are both set; use one`);
+      process.exit(1);
+    }
+    try {
+      readPasswordFile(opts.credentialFile);
+    } catch (err) {
+      console.error(`pgserve postmaster: ${err.message}`);
+      process.exit(1);
+    }
+    logger.info({ source: 'password-file' }, 'pgserve postmaster: using managed superuser password');
+  } else if (passwordSource !== 'default') {
+    logger.info({ source: passwordSource }, 'pgserve postmaster: using managed superuser password');
+  }
+
   // Resolve and ensure the socket directory before postgres tries to bind.
   // Surfaces "not writable" / "wrong owner" failures here with a clear
   // diagnostic instead of leaving the operator to chase a libpq error.
@@ -94,16 +118,6 @@ async function runPostmasterSubcommand(postmasterArgs) {
     process.exit(1);
   }
 
-  // Managed superuser password (AUTOPG_PG_PASSWORD / PGSERVE_PG_PASSWORD,
-  // default 'postgres'). PostgresManager feeds it to initdb's --pwfile on
-  // fresh clusters AND to its TCP admin pool — without this wire a rotated
-  // password crash-loops every postmaster restart (admin pool refused).
-  // Log the SOURCE only, never the value.
-  const { password, source: passwordSource } = resolvePostmasterPassword();
-  if (passwordSource !== 'default') {
-    logger.info({ source: passwordSource }, 'pgserve postmaster: using managed superuser password');
-  }
-
   const manager = new PostgresManager({
     dataDir: opts.dataDir,
     port: opts.port,
@@ -111,6 +125,7 @@ async function runPostmasterSubcommand(postmasterArgs) {
     useRam: opts.useRam,
     enablePgvector: opts.enablePgvector,
     password,
+    credentialFile: opts.credentialFile,
     logger: logger.child({ component: 'postgres' }),
   });
 
@@ -220,6 +235,15 @@ function parsePostmasterArgs(postmasterArgs) {
       case '--pgvector':
         opts.enablePgvector = true;
         break;
+      case '--password-file': {
+        const value = postmasterArgs[++i];
+        if (value === undefined || value === '') {
+          console.error('pgserve postmaster: --password-file needs a path');
+          process.exit(1);
+        }
+        opts.credentialFile = value;
+        break;
+      }
       case '--help':
         process.stdout.write(`
 pgserve postmaster — direct embedded PostgreSQL supervision (singleton v2.4)
@@ -234,6 +258,9 @@ OPTIONS:
   --log, -l <level>     Log level: error|warn|info|debug (default: info)
   --ram                 Use /dev/shm (Linux only)
   --pgvector            Auto-enable pgvector on new databases
+  --password-file <p>   Superuser password file (absolute path, mode 0600,
+                        one line). The cluster then takes scram-sha-256
+                        logins on 127.0.0.1 only and logs no statements.
   --help                Show this help
 
 ENVIRONMENT:
