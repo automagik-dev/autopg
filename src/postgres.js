@@ -964,13 +964,16 @@ export class PostgresManager extends EventEmitter {
       // and `logrotate.d/pgserve` rotates it.
       const pgauditPath = path.join(this.binaries.libDir, '..', 'lib', 'postgresql', 'pgaudit.so');
       if (this.credentialFile) {
-        // A password-file cluster logs no statements and listens on
-        // 127.0.0.1 only (its pg_hba has no other host). Last -c wins, so
-        // settings.json cannot turn either back on.
+        // A password-file cluster logs no statements, listens on 127.0.0.1
+        // only and uses the pg_hba written in start(). Last -c wins, so
+        // settings.json (`postgres._extra` included) cannot change these.
+        const hbaFile = path.join(this.databaseDir, 'pg_hba.conf');
         pgArgs.push('-c', 'log_statement=none');
         pgArgs.push('-c', 'listen_addresses=127.0.0.1');
+        pgArgs.push('-c', `hba_file=${hbaFile}`);
         appliedGucs.log_statement = 'none';
         appliedGucs.listen_addresses = '127.0.0.1';
+        appliedGucs.hba_file = hbaFile;
       } else if (fs.existsSync(pgauditPath)) {
         pgArgs.push('-c', 'shared_preload_libraries=pgaudit');
         pgArgs.push('-c', 'pgaudit.log=all');

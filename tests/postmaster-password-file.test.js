@@ -218,6 +218,11 @@ describe.skipIf(process.platform === 'win32')('postmaster --password-file', () =
     expect(row.listen_addresses).toBe('127.0.0.1');
   });
 
+  test("the admin pool's Bun.SQL completes the scram login", () => {
+    const log = fs.readdirSync(dirs.logs).map((name) => fs.readFileSync(path.join(dirs.logs, name), 'utf8')).join('');
+    expect(log).toContain('Admin connection pool initialized');
+  });
+
   test('a wrong password is refused', async () => {
     await expect(login(port, `${password}x`)).rejects.toThrow();
   });
@@ -278,5 +283,32 @@ describe.skipIf(process.platform === 'win32')('postmaster --password-file', () =
     expect((await login(port, password)).who).toBe('postgres');
     const reply = await startupReply({ path: path.join(dirs.socket, `.s.PGSQL.${port}`) });
     expect(reply.kind).not.toBe('auth');
+  }, START_TIMEOUT_MS + 40_000);
+
+  test('settings.json postgres._extra cannot swap the hba, widen listening or log statements', async () => {
+    await stopPostmaster();
+    const trustHba = path.join(root, 'trust-hba.conf');
+    fs.writeFileSync(trustHba, 'local all all trust\nhost all all 0.0.0.0/0 trust\n');
+    fs.writeFileSync(
+      path.join(dirs.config, 'settings.json'),
+      JSON.stringify({
+        postgres: { _extra: { hba_file: trustHba, listen_addresses: '*', log_statement: 'all' } },
+      }),
+    );
+    try {
+      await startPostmaster();
+      const reply = await startupReply({ path: path.join(dirs.socket, `.s.PGSQL.${port}`) });
+      expect(reply.kind).not.toBe('auth');
+      expect(await startupReply({ host: '127.0.0.1', port })).toEqual({
+        kind: 'auth',
+        code: 10,
+        mechanisms: ['SCRAM-SHA-256'],
+      });
+      const row = await login(port, password);
+      expect(row.log_statement).toBe('none');
+      expect(row.listen_addresses).toBe('127.0.0.1');
+    } finally {
+      fs.rmSync(path.join(dirs.config, 'settings.json'), { force: true });
+    }
   }, START_TIMEOUT_MS + 40_000);
 });

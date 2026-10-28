@@ -98,8 +98,10 @@ inline next to the offending control.
   admin pool reads it at every start. That cluster's `pg_hba.conf` is
   rewritten at every start to the single line
   `host all all 127.0.0.1/32 scram-sha-256`, postgres listens on
-  `127.0.0.1` only, and `log_statement` is pinned to `none` (no pgaudit,
-  no `log_statement=all` fallback). Unix-socket logins are refused.
+  `127.0.0.1` only, `hba_file` points at that file, and `log_statement`
+  is pinned to `none` (no pgaudit, no `log_statement=all` fallback).
+  These are set after `postgres._extra`, so it cannot change them.
+  Unix-socket logins are refused.
 
 ### `runtime` — logging + provisioning + data dir
 
