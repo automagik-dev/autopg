@@ -91,7 +91,33 @@ inline next to the offending control.
 - `server.pgUser` — Backend superuser.
 - `server.pgPassword` — Backend superuser password. The file is
   written with mode `0600`; do not commit `~/.autopg/settings.json`
-  to source control.
+  to source control. A supervisor that must keep the password out of
+  env and argv passes `postmaster --password-file <path>` instead (an
+  absolute path to a `0600` file holding one line; it cannot be
+  combined with the env vars). pgserve opens the file once at every
+  start, before it fetches or initializes anything; initdb gets the
+  password on stdin and the admin pool logs in with it. pgserve never
+  sends the password as SQL. That cluster's `pg_hba.conf` is rewritten at every start to
+  the single line `host all all 127.0.0.1/32 scram-sha-256`, postgres
+  listens on `127.0.0.1` only and `hba_file` points at that file.
+  `postgres._extra` and the curated `log_statement` and
+  `log_min_duration_statement` keys are ignored (with a warning naming
+  the `_extra` keys), and these are pinned on argv, which outranks
+  `postgresql.conf`, `ALTER SYSTEM` and `config_file`:
+  `log_statement=none`, `log_duration=off`,
+  `log_min_duration_statement=-1`, the sampling settings,
+  `log_min_error_statement=panic`, `log_min_messages=warning`,
+  `log_parameter_max_length*=0`, `debug_print_*=off`,
+  `logging_collector=off`, `log_destination=stderr`, the three
+  `*_preload_libraries=''` (no pgaudit, no auto_explain),
+  `password_encryption=scram-sha-256` and `scram_iterations=4096`.
+  A superuser session can still `SET` its own logging; only holders of
+  the password can do that. postgres makes no Unix socket (`-k ''`), so
+  a long `--socket-dir` cannot stop it starting; the dir still holds
+  `runtime.json`. Initialize a fresh data dir under the flag: a cluster
+  made without it keeps its old password, so the postmaster refuses it
+  and exits 1 after stopping postgres (its `pg_hba.conf` is left
+  scram-only).
 
 ### `runtime` — logging + provisioning + data dir
 

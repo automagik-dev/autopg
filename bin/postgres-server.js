@@ -83,6 +83,24 @@ async function runPostmasterSubcommand(postmasterArgs) {
   const opts = parsePostmasterArgs(postmasterArgs);
   const logger = createLogger({ level: opts.logLevel });
 
+  // Managed superuser password (AUTOPG_PG_PASSWORD / PGSERVE_PG_PASSWORD,
+  // default 'postgres'). PostgresManager feeds it to initdb's --pwfile on
+  // fresh clusters AND to its TCP admin pool — without this wire a rotated
+  // password crash-loops every postmaster restart (admin pool refused).
+  // Log the SOURCE only, never the value.
+  const { password, source: passwordSource } = resolvePostmasterPassword();
+  if (opts.credentialFile !== undefined) {
+    // --password-file: scram-only cluster (see PostgresManager credentialFile).
+    // The manager opens the file once, before it creates anything.
+    if (passwordSource !== 'default') {
+      console.error(`pgserve postmaster: --password-file and ${passwordSource} are both set; use one`);
+      process.exit(1);
+    }
+    logger.info({ source: 'password-file' }, 'pgserve postmaster: using managed superuser password');
+  } else if (passwordSource !== 'default') {
+    logger.info({ source: passwordSource }, 'pgserve postmaster: using managed superuser password');
+  }
+
   // Resolve and ensure the socket directory before postgres tries to bind.
   // Surfaces "not writable" / "wrong owner" failures here with a clear
   // diagnostic instead of leaving the operator to chase a libpq error.
@@ -94,16 +112,6 @@ async function runPostmasterSubcommand(postmasterArgs) {
     process.exit(1);
   }
 
-  // Managed superuser password (AUTOPG_PG_PASSWORD / PGSERVE_PG_PASSWORD,
-  // default 'postgres'). PostgresManager feeds it to initdb's --pwfile on
-  // fresh clusters AND to its TCP admin pool — without this wire a rotated
-  // password crash-loops every postmaster restart (admin pool refused).
-  // Log the SOURCE only, never the value.
-  const { password, source: passwordSource } = resolvePostmasterPassword();
-  if (passwordSource !== 'default') {
-    logger.info({ source: passwordSource }, 'pgserve postmaster: using managed superuser password');
-  }
-
   const manager = new PostgresManager({
     dataDir: opts.dataDir,
     port: opts.port,
@@ -111,6 +119,7 @@ async function runPostmasterSubcommand(postmasterArgs) {
     useRam: opts.useRam,
     enablePgvector: opts.enablePgvector,
     password,
+    credentialFile: opts.credentialFile,
     logger: logger.child({ component: 'postgres' }),
   });
 
@@ -128,6 +137,12 @@ async function runPostmasterSubcommand(postmasterArgs) {
     await manager.start();
   } catch (err) {
     logger.error({ err: err.message }, 'pgserve postmaster: failed to start');
+    // start() can fail after postgres is up (the admin pool refused); stop
+    // it, or it outlives us with PPID 1, holding the port and data dir.
+    await manager.stop().catch((stopErr) => {
+      logger.warn({ err: stopErr.message }, 'pgserve postmaster: stop after a failed start failed');
+      manager.process?.kill('SIGKILL');
+    });
     process.exit(1);
   }
 
@@ -154,7 +169,9 @@ async function runPostmasterSubcommand(postmasterArgs) {
 
   logger.info(
     { port: opts.port, socketDir, dataDir: opts.dataDir },
-    'pgserve postmaster: ready (Unix socket + TCP)',
+    opts.credentialFile !== undefined
+      ? 'pgserve postmaster: ready (TCP 127.0.0.1 only)'
+      : 'pgserve postmaster: ready (Unix socket + TCP)',
   );
 
   const shutdown = async (signal) => {
@@ -220,6 +237,15 @@ function parsePostmasterArgs(postmasterArgs) {
       case '--pgvector':
         opts.enablePgvector = true;
         break;
+      case '--password-file': {
+        const value = postmasterArgs[++i];
+        if (value === undefined || value === '') {
+          console.error('pgserve postmaster: --password-file needs a path');
+          process.exit(1);
+        }
+        opts.credentialFile = value;
+        break;
+      }
       case '--help':
         process.stdout.write(`
 pgserve postmaster — direct embedded PostgreSQL supervision (singleton v2.4)
@@ -234,6 +260,10 @@ OPTIONS:
   --log, -l <level>     Log level: error|warn|info|debug (default: info)
   --ram                 Use /dev/shm (Linux only)
   --pgvector            Auto-enable pgvector on new databases
+  --password-file <p>   Superuser password file (absolute path, mode 0600,
+                        one line). The cluster then takes scram-sha-256
+                        logins on 127.0.0.1 only, makes no Unix socket
+                        and logs no statements.
   --help                Show this help
 
 ENVIRONMENT:

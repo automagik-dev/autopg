@@ -19,7 +19,7 @@
  * and the `.catch` path; (3) the wrapper end to end for `--help`.
  */
 
-import { test, expect, describe, beforeEach, afterEach, mock } from 'bun:test';
+import { test, expect, describe, beforeEach, afterEach, afterAll, mock } from 'bun:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -73,8 +73,16 @@ describe('src/cli-install.cjs dynamic imports are bundleable (issue #160)', () =
 // each test choose what `update()` does without touching a postmaster.
 // ---------------------------------------------------------------------------
 
+// mock.module is process-wide: a later test file in the same run imports
+// the same module. So the mock keeps the other exports (STEPS), and the
+// real exports, copied before mocking, are put back when this file ends.
+const realUpdateExports = { ...(await import(UPDATE_MODULE)) };
 const updateMock = mock(async () => ({ ok: true, results: [], summary: 'mocked' }));
-mock.module(UPDATE_MODULE, () => ({ update: updateMock }));
+mock.module(UPDATE_MODULE, () => ({ ...realUpdateExports, update: updateMock }));
+afterAll(() => {
+  updateMock.mockReset();
+  mock.module(UPDATE_MODULE, () => realUpdateExports);
+});
 
 describe('dispatch("update", …) in process (issue #160)', () => {
   let cli;

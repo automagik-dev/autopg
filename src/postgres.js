@@ -28,10 +28,70 @@ import {
   resolvePgvectorDebVersions,
 } from './pgvector-version.js';
 import { createBoundedTail, drainStream } from './lib/drain-stream.js';
+import { readPasswordFile } from './lib/postmaster-password.js';
 
 // How much of postgres's stdout/stderr is kept for startup-failure and crash
 // diagnostics. Both only need the end of the output.
 const STARTUP_OUTPUT_TAIL_CHARS = 64 * 1024;
+
+// The whole pg_hba of a password-file cluster: scram over 127.0.0.1 and
+// nothing else, so no trust line, no Unix-socket line and no other host.
+const PASSWORD_FILE_HBA = 'host all all 127.0.0.1/32 scram-sha-256';
+
+// Pinned on argv for a password-file cluster, after everything else, so no
+// settings file, `postgres._extra`, config_file or postgresql.conf can
+// change them. They keep statement text (and bind values, and the debug
+// parse/bind lines) out of every log, keep log files off disk, load no
+// library that logs queries (auto_explain, pgaudit), and keep later
+// verifiers scram at the default iteration count. The password itself is
+// set only by initdb, never as SQL.
+const PASSWORD_FILE_PINNED_GUCS = {
+  log_statement: 'none',
+  log_duration: 'off',
+  log_min_duration_statement: '-1',
+  log_min_duration_sample: '-1',
+  log_statement_sample_rate: '0',
+  log_transaction_sample_rate: '0',
+  log_min_error_statement: 'panic',
+  log_parameter_max_length: '0',
+  log_parameter_max_length_on_error: '0',
+  log_replication_commands: 'off',
+  debug_print_parse: 'off',
+  debug_print_rewritten: 'off',
+  debug_print_plan: 'off',
+  log_min_messages: 'warning',
+  log_destination: 'stderr',
+  logging_collector: 'off',
+  shared_preload_libraries: '',
+  session_preload_libraries: '',
+  local_preload_libraries: '',
+  password_encryption: 'scram-sha-256',
+  scram_iterations: '4096',
+};
+
+// initdb reads a password-file cluster's password from here (POSIX).
+const STDIN_PATH = '/dev/stdin';
+
+// settings.json keys a password-file cluster ignores: the free-form
+// `_extra` map and the curated statement-logging keys.
+const PASSWORD_FILE_IGNORED_SETTINGS = ['_extra', 'log_statement', 'log_min_duration_statement'];
+
+/**
+ * settings.json `postgres` without the keys a password-file cluster
+ * ignores. Warns with the `_extra` names, never their values.
+ */
+function passwordFileSettings(postgresSettings, logger) {
+  const kept = { ...(postgresSettings || {}) };
+  for (const key of PASSWORD_FILE_IGNORED_SETTINGS) delete kept[key];
+  const extras = postgresSettings?._extra;
+  if (extras && typeof extras === 'object' && Object.keys(extras).length > 0) {
+    logger?.warn?.(
+      { ignored: Object.keys(extras).map((name) => `_extra.${name}`) },
+      'password-file mode ignores postgres._extra',
+    );
+  }
+  return kept;
+}
 
 /**
  * Get platform key for binary lookup (e.g., 'windows-x64', 'linux-x64', 'darwin-arm64')
@@ -551,6 +611,11 @@ export class PostgresManager extends EventEmitter {
     this.port = options.port ?? 5433; // Internal PG port (router listens on different port)
     this.user = options.user || 'postgres';
     this.password = options.password || 'postgres';
+    // Superuser password file (`postmaster --password-file`). When set it is
+    // the only source of the password; start() reads it once, initdb gets it
+    // on stdin, the admin pool logs in with it, and the cluster is scram-only
+    // on 127.0.0.1 with statement logging off (see _runInitDb, _startPostgres).
+    this.credentialFile = options.credentialFile || null;
     this.logger = options.logger;
     this.process = null;
     this.databaseDir = null;
@@ -606,6 +671,12 @@ export class PostgresManager extends EventEmitter {
       return this;
     }
 
+    // The password file is opened once, here, before anything is fetched
+    // or created, so a refused file leaves no trace.
+    if (this.credentialFile) {
+      this.password = readPasswordFile(this.credentialFile);
+    }
+
     // Get binary paths (may extract bundled binaries on first run)
     this.binaries = await getBinaryPaths();
 
@@ -652,8 +723,11 @@ export class PostgresManager extends EventEmitter {
       }
     }
 
-    // Create Unix socket directory (Linux/macOS only, Windows uses TCP)
-    if (os.platform() !== 'win32') {
+    // Create Unix socket directory (Linux/macOS only, Windows uses TCP).
+    // A password-file cluster has no socket (`-k ''` below): its pg_hba
+    // refuses socket logins anyway, and a socket path over the OS limit
+    // would stop postgres starting.
+    if (os.platform() !== 'win32' && !this.credentialFile) {
       if (this.explicitSocketDir) {
         // pgserve singleton (v2.4): operator-supplied socket dir is created
         // and chmoded by the install path (`pgserve install`); we only
@@ -690,11 +764,30 @@ export class PostgresManager extends EventEmitter {
       this.logger.debug({ databaseDir: this.databaseDir }, 'Using existing data directory');
     }
 
+    // Every start, so an edited pg_hba comes back to scram-only. A cluster
+    // made without the file keeps its old password, so the admin pool login
+    // below is refused and start() fails (see the error there).
+    if (this.credentialFile) {
+      fs.writeFileSync(
+        path.join(this.databaseDir, 'pg_hba.conf'),
+        `# Written by pgserve at every start (--password-file).\n${PASSWORD_FILE_HBA}\n`,
+        { mode: 0o600 },
+      );
+    }
+
     // Start PostgreSQL server
     await this._startPostgres();
 
     // Initialize admin connection pool (for database creation operations)
-    await this._initAdminPool();
+    try {
+      await this._initAdminPool();
+    } catch (err) {
+      if (!this.credentialFile) throw err;
+      throw new Error(
+        `${err.message}. The cluster's superuser password is not the password file's: `
+        + 'a cluster made without --password-file cannot be adopted; initdb a fresh data dir',
+      );
+    }
 
     // For persistent mode, load existing databases into createdDatabases
     // This prevents "database already exists" errors when reusing data directories
@@ -723,11 +816,26 @@ export class PostgresManager extends EventEmitter {
    * Uses Bun.spawn() for ~40% faster process startup
    */
   async _runInitDb() {
-    // Create password file
-    const randomId = crypto.randomBytes(6).toString('hex');
-    const passwordFile = path.join(os.tmpdir(), `pg-password-${randomId}`);
-    await Bun.write(passwordFile, this.password + '\n');
-    await fs.promises.chmod(passwordFile, 0o600); // Secure file permissions
+    // With a caller's password file, initdb gets the password start() read
+    // from it on stdin (POSIX), so the file is opened once and never copied
+    // or removed. Otherwise the password goes to a temp file.
+    const callerFile = this.credentialFile;
+    const viaStdin = Boolean(callerFile) && os.platform() !== 'win32';
+    let initdbInput = viaStdin ? STDIN_PATH : callerFile;
+    if (!callerFile) {
+      const randomId = crypto.randomBytes(6).toString('hex');
+      initdbInput = path.join(os.tmpdir(), `pg-password-${randomId}`);
+      await Bun.write(initdbInput, this.password + '\n');
+      await fs.promises.chmod(initdbInput, 0o600); // Secure file permissions
+    }
+    const removeTempFile = async () => {
+      if (callerFile) return;
+      try {
+        await fs.promises.unlink(initdbInput);
+      } catch {
+        // Ignore cleanup errors
+      }
+    };
 
     this.logger.debug({ databaseDir: this.databaseDir }, 'Initializing PostgreSQL data directory');
 
@@ -735,13 +843,13 @@ export class PostgresManager extends EventEmitter {
       const initdbCmd = [
         this.binaries.initdb,
         `--pgdata=${this.databaseDir}`,
-        '--auth-local=trust',
-        '--auth-host=password',
+        ...(callerFile ? ['--auth=scram-sha-256'] : ['--auth-local=trust', '--auth-host=password']),
         `--username=${this.user}`,
-        `--pwfile=${passwordFile}`,
+        `--pwfile=${initdbInput}`,
       ];
       const proc = Bun.spawn(buildCommand(initdbCmd, this.binaries.libDir), {
         env: buildSpawnEnv(this.binaries.libDir),
+        ...(viaStdin ? { stdin: Buffer.from(`${this.password}\n`) } : {}),
         stdout: 'pipe',
         stderr: 'pipe'
       });
@@ -755,12 +863,7 @@ export class PostgresManager extends EventEmitter {
       // Wait for process to complete
       const exitCode = await proc.exited;
 
-      // Clean up password file
-      try {
-        await fs.promises.unlink(passwordFile);
-      } catch {
-        // Ignore cleanup errors
-      }
+      await removeTempFile();
 
       if (exitCode === 0) {
         this.logger.debug('initdb completed successfully');
@@ -769,12 +872,7 @@ export class PostgresManager extends EventEmitter {
         throw new Error(`initdb failed with code ${exitCode}: ${stderr || stdout}`);
       }
     } catch (err) {
-      // Clean up password file on error
-      try {
-        await fs.promises.unlink(passwordFile);
-      } catch {
-        // Ignore cleanup errors
-      }
+      await removeTempFile();
       throw new Error(`Failed to run initdb: ${err.message}`);
     }
   }
@@ -917,7 +1015,7 @@ export class PostgresManager extends EventEmitter {
       // dropped with a logger.warn — postgres still starts.
       const { settings } = loadEffectiveConfig({ logger: this.logger });
       const { args: gucArgs, applied: appliedGucs } = buildPostgresArgs(
-        settings.postgres,
+        this.credentialFile ? passwordFileSettings(settings.postgres, this.logger) : settings.postgres,
         { logger: this.logger },
       );
 
@@ -937,7 +1035,20 @@ export class PostgresManager extends EventEmitter {
       // pm2 captures stderr to `<configDir>/logs/autopg-server-error.log`
       // and `logrotate.d/pgserve` rotates it.
       const pgauditPath = path.join(this.binaries.libDir, '..', 'lib', 'postgresql', 'pgaudit.so');
-      if (fs.existsSync(pgauditPath)) {
+      if (this.credentialFile) {
+        // A password-file cluster: the pins above, plus 127.0.0.1 only and
+        // the pg_hba written in start(). Last -c wins.
+        const pinned = {
+          ...PASSWORD_FILE_PINNED_GUCS,
+          listen_addresses: '127.0.0.1',
+          hba_file: path.join(this.databaseDir, 'pg_hba.conf'),
+          config_file: path.join(this.databaseDir, 'postgresql.conf'),
+        };
+        for (const [name, value] of Object.entries(pinned)) {
+          pgArgs.push('-c', `${name}=${value}`);
+          appliedGucs[name] = value;
+        }
+      } else if (fs.existsSync(pgauditPath)) {
         pgArgs.push('-c', 'shared_preload_libraries=pgaudit');
         pgArgs.push('-c', 'pgaudit.log=all');
         pgArgs.push('-c', 'pgaudit.log_catalog=off');
