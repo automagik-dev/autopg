@@ -1,0 +1,5 @@
+# The image is built entirely from a release tarball fetched inside the
+# Dockerfile — no repo source is copied in. Exclude everything so the build
+# context stays tiny and unrelated repo churn never invalidates the cache.
+*
+!Dockerfile
