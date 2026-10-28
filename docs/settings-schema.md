@@ -101,7 +101,8 @@ inline next to the offending control.
   `127.0.0.1` only, `hba_file` points at that file, and `log_statement`
   is pinned to `none` (no pgaudit, no `log_statement=all` fallback).
   These are set after `postgres._extra`, so it cannot change them.
-  Unix-socket logins are refused.
+  postgres makes no Unix socket (`-k ''`), so a long `--socket-dir`
+  cannot stop it starting; the dir still holds `runtime.json`.
 
 ### `runtime` — logging + provisioning + data dir
 

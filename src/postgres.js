@@ -662,8 +662,11 @@ export class PostgresManager extends EventEmitter {
       }
     }
 
-    // Create Unix socket directory (Linux/macOS only, Windows uses TCP)
-    if (os.platform() !== 'win32') {
+    // Create Unix socket directory (Linux/macOS only, Windows uses TCP).
+    // A password-file cluster has no socket (`-k ''` below): its pg_hba
+    // refuses socket logins anyway, and a socket path over the OS limit
+    // would stop postgres starting.
+    if (os.platform() !== 'win32' && !this.credentialFile) {
       if (this.explicitSocketDir) {
         // pgserve singleton (v2.4): operator-supplied socket dir is created
         // and chmoded by the install path (`pgserve install`); we only

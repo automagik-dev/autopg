@@ -7,6 +7,9 @@
  * and the admin pool by path only, never through argv, a log or SQL.
  *
  * Every run uses its own config dir, data dir, socket dir and a free port.
+ * The socket dir name is long enough that `<dir>/.s.PGSQL.<port>` would
+ * pass the Unix socket path limit (103 bytes on macOS, 107 on Linux): the
+ * cluster must start anyway, because it makes no socket.
  * AUTOPG_TEST_PG_CACHE may name an extracted Postgres build
  * (`<config>/bin/<platform>`) to copy in; without it the postmaster
  * downloads one on first start, as it does in production.
@@ -179,6 +182,7 @@ describe.skipIf(process.platform === 'win32')('postmaster --password-file', () =
     dirs = Object.fromEntries(
       ['home', 'config', 'data', 'socket', 'tmp', 'logs'].map((name) => [name, path.join(root, name)]),
     );
+    dirs.socket = path.join(root, `socket-${'x'.repeat(80)}`);
     for (const dir of Object.values(dirs)) fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     if (process.env.AUTOPG_TEST_PG_CACHE) {
       fs.cpSync(process.env.AUTOPG_TEST_PG_CACHE, path.join(dirs.config, 'bin', platformKey()), {
@@ -238,6 +242,10 @@ describe.skipIf(process.platform === 'win32')('postmaster --password-file', () =
   test('a Unix-socket client is refused', async () => {
     const reply = await startupReply({ path: path.join(dirs.socket, `.s.PGSQL.${port}`) });
     expect(reply.kind).not.toBe('auth');
+  });
+
+  test('postgres makes no Unix socket', () => {
+    expect(fs.readdirSync(dirs.socket).filter((name) => name.startsWith('.s.PGSQL.'))).toEqual([]);
   });
 
   test('an ::1 client is refused', async () => {

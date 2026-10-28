@@ -169,7 +169,9 @@ async function runPostmasterSubcommand(postmasterArgs) {
 
   logger.info(
     { port: opts.port, socketDir, dataDir: opts.dataDir },
-    'pgserve postmaster: ready (Unix socket + TCP)',
+    opts.credentialFile !== undefined
+      ? 'pgserve postmaster: ready (TCP 127.0.0.1 only)'
+      : 'pgserve postmaster: ready (Unix socket + TCP)',
   );
 
   const shutdown = async (signal) => {
@@ -260,7 +262,8 @@ OPTIONS:
   --pgvector            Auto-enable pgvector on new databases
   --password-file <p>   Superuser password file (absolute path, mode 0600,
                         one line). The cluster then takes scram-sha-256
-                        logins on 127.0.0.1 only and logs no statements.
+                        logins on 127.0.0.1 only, makes no Unix socket
+                        and logs no statements.
   --help                Show this help
 
 ENVIRONMENT:
