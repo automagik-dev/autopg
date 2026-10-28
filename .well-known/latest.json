@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "channel": "stable",
-  "version": "3.2.2",
-  "released_at": "2026-09-19T19:08:52Z",
-  "tarball_base": "https://github.com/automagik-dev/autopg/releases/download/v3.2.2",
+  "version": "3.3.0",
+  "released_at": "2026-10-28T22:35:25Z",
+  "tarball_base": "https://github.com/automagik-dev/autopg/releases/download/v3.3.0",
   "platforms": ["linux-x64-glibc","linux-arm64","darwin-arm64"]
 }
