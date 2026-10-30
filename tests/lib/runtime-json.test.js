@@ -7,6 +7,7 @@
  *   - NO `supervisor` key (that field lives only in `~/.autopg/admin.json`)
  *   - reads return null on missing or malformed input — never throw
  *   - clearRuntimeJson is best-effort and idempotent
+ *   - the keeper restores a file a tmp cleaner deleted and refreshes its mtime
  */
 
 import { test, expect, beforeEach, afterEach, describe } from 'bun:test';
@@ -21,6 +22,8 @@ import {
   clearRuntimeJson,
   getRuntimeFilePath,
   isLiveRuntime,
+  keepRuntimeJson,
+  keepRuntimeJsonOnce,
   readRuntimeJson,
   writeRuntimeJson,
 } from '../../src/lib/runtime-json.js';
@@ -183,5 +186,51 @@ describe('isLiveRuntime', () => {
     expect(isLiveRuntime({})).toBe(false);
     expect(isLiveRuntime({ autopgPid: 'string' })).toBe(false);
     expect(isLiveRuntime({ autopgPid: -1 })).toBe(false);
+  });
+});
+
+describe('keepRuntimeJsonOnce', () => {
+  test('rewrites the record after a tmp cleaner deleted it', () => {
+    writeRuntimeJson(makeRecord());
+    fs.unlinkSync(getRuntimeFilePath(tmpDir));
+    expect(keepRuntimeJsonOnce(makeRecord())).toBe('rewritten');
+    expect(readRuntimeJson(tmpDir)).toEqual({ ...makeRecord(), schemaVersion: RUNTIME_SCHEMA_VERSION });
+  });
+
+  test('rewrites a record that points at another postmaster', () => {
+    writeRuntimeJson(makeRecord({ pid: 999 }));
+    expect(keepRuntimeJsonOnce(makeRecord())).toBe('rewritten');
+    expect(readRuntimeJson(tmpDir).pid).toBe(12345);
+  });
+
+  test('only refreshes the timestamps of a matching record', () => {
+    writeRuntimeJson(makeRecord());
+    const file = getRuntimeFilePath(tmpDir);
+    const old = new Date(Date.now() - 5 * 24 * 3600 * 1000);
+    fs.utimesSync(file, old, old);
+    const before = fs.readFileSync(file, 'utf8');
+    expect(keepRuntimeJsonOnce(makeRecord())).toBe('touched');
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
+    expect(Date.now() - fs.statSync(file).mtimeMs).toBeLessThan(60_000);
+  });
+
+  test('reports failure instead of throwing when the record is invalid', () => {
+    expect(keepRuntimeJsonOnce(makeRecord({ port: 0 }))).toBe('failed');
+  });
+});
+
+describe('keepRuntimeJson', () => {
+  test('restores the file on its interval and stops when asked', async () => {
+    writeRuntimeJson(makeRecord());
+    const acted = [];
+    const stop = keepRuntimeJson(makeRecord(), { intervalMs: 10, onRewrite: (r) => acted.push(r) });
+    fs.unlinkSync(getRuntimeFilePath(tmpDir));
+    await new Promise((r) => setTimeout(r, 50));
+    stop();
+    expect(fs.existsSync(getRuntimeFilePath(tmpDir))).toBe(true);
+    expect(acted).toContain('rewritten');
+    clearRuntimeJson(tmpDir);
+    await new Promise((r) => setTimeout(r, 30));
+    expect(fs.existsSync(getRuntimeFilePath(tmpDir))).toBe(false);
   });
 });
