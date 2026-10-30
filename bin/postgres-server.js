@@ -18,7 +18,7 @@
 import { PostgresManager } from '../src/postgres.js';
 import { resolvePostmasterPassword } from '../src/lib/postmaster-password.js';
 import { resolveSocketDir, ensureSocketDir } from '../src/lib/socket-dir.js';
-import { writeRuntimeJson, clearRuntimeJson } from '../src/lib/runtime-json.js';
+import { writeRuntimeJson, clearRuntimeJson, keepRuntimeJson } from '../src/lib/runtime-json.js';
 import { createLogger } from '../src/logger.js';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -153,12 +153,19 @@ async function runPostmasterSubcommand(postmasterArgs) {
   // socket info) — that split lets the postmaster restart under a new
   // pid without rewriting the supervisor record. NO `supervisor` key
   // here; the writer rejects it.
+  const runtimeRecord = {
+    socketDir,
+    port: opts.port,
+    pid: manager.process?.pid ?? process.pid,
+    autopgPid: process.pid,
+  };
+  let stopKeeper = () => {};
   try {
-    writeRuntimeJson({
-      socketDir,
-      port: opts.port,
-      pid: manager.process?.pid ?? process.pid,
-      autopgPid: process.pid,
+    writeRuntimeJson(runtimeRecord);
+    // Tmp cleaners delete runtime.json on an idle host while we are still up;
+    // re-assert it every minute (see keepRuntimeJson).
+    stopKeeper = keepRuntimeJson(runtimeRecord, {
+      onRewrite: (result) => logger.warn({ result }, 'pgserve postmaster: runtime.json keeper acted (rewritten = file was missing or stale; failed = could not write)'),
     });
   } catch (err) {
     logger.warn(
@@ -181,6 +188,7 @@ async function runPostmasterSubcommand(postmasterArgs) {
     // socket" instead of racing against a stale-pid record. On crash
     // (uncaughtException, backend died) the file is left behind; the
     // operator-facing detector is `process.kill(record.autopgPid, 0)`.
+    stopKeeper();
     clearRuntimeJson(socketDir);
     try {
       await manager.stop();

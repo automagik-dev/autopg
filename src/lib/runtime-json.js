@@ -179,3 +179,51 @@ export function isLiveRuntime(record) {
     return err && err.code === 'EPERM';
   }
 }
+
+/** How often the postmaster re-asserts its runtime record (see keepRuntimeJson). */
+export const RUNTIME_KEEP_INTERVAL_MS = 60_000;
+
+/**
+ * One keeper tick: rewrite `<socketDir>/runtime.json` when it is missing or no
+ * longer matches `record`, otherwise refresh its timestamps. Returns
+ * `'rewritten'`, `'touched'` or `'failed'`; never throws.
+ *
+ * Why: the socket dir usually lives under /tmp, and tmp cleaners (macOS's
+ * daily cleanup, systemd-tmpfiles) delete files that have not been touched
+ * for a few days. Postgres guards its own socket lock file the same way;
+ * without this, an idle host loses runtime.json while the postmaster is
+ * still up, and every consumer then fails runtime discovery.
+ */
+export function keepRuntimeJsonOnce(record) {
+  try {
+    const current = readRuntimeJson(record.socketDir);
+    const wanted = { schemaVersion: RUNTIME_SCHEMA_VERSION, ...record };
+    const same = current !== null
+      && Object.keys(wanted).every((k) => current[k] === wanted[k]);
+    if (!same) {
+      writeRuntimeJson(record);
+      return 'rewritten';
+    }
+    const now = new Date();
+    fs.utimesSync(getRuntimeFilePath(record.socketDir), now, now);
+    return 'touched';
+  } catch {
+    return 'failed';
+  }
+}
+
+/**
+ * Run `keepRuntimeJsonOnce(record)` every `intervalMs` for the life of the
+ * postmaster. The timer is unref'd so it never holds the process open.
+ * `onRewrite(result)` is called when a tick had to rewrite or failed, so the
+ * caller can log it. Returns a stop function; call it before
+ * `clearRuntimeJson()` on shutdown so the keeper cannot resurrect the file.
+ */
+export function keepRuntimeJson(record, { intervalMs = RUNTIME_KEEP_INTERVAL_MS, onRewrite } = {}) {
+  const timer = setInterval(() => {
+    const result = keepRuntimeJsonOnce(record);
+    if (result !== 'touched' && onRewrite) onRewrite(result);
+  }, intervalMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
